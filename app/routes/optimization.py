@@ -11,9 +11,8 @@ import hashlib
 
 from app.database import get_db
 from app.models.issue import Issue
-from app.models.worker import Worker
-from app.models.citizen import Citizen
-from app.core.security import get_current_user
+from app.models.user import User
+from app.core.deps import get_current_user
 
 router = APIRouter()
 
@@ -115,14 +114,19 @@ async def get_dashboard_analytics(
 
         # Worker stats
         active_workers = (
-            db.query(func.count(Worker.id))
-            .filter(Worker.is_active == True)
+            db.query(func.count(User.id))
+            .filter(User.role == "worker", User.is_active == True)
             .scalar()
             or 0
         )
 
         # Citizens stats
-        total_citizens = db.query(func.count(Citizen.id)).scalar() or 0
+        total_citizens = (
+            db.query(func.count(User.id))
+            .filter(User.role == "citizen")
+            .scalar()
+            or 0
+        )
 
         # Issue type distribution
         type_distribution = (
@@ -256,13 +260,14 @@ async def get_performance_metrics(
         # Top performing workers
         top_workers = (
             db.query(
-                Worker.id,
-                Worker.name,
+                User.id,
+                User.name,
                 func.count(Issue.id).label('resolved_count'),
             )
-            .outerjoin(Issue, Issue.assigned_to_id == Worker.id)
+            .filter(User.role == "worker")
+            .outerjoin(Issue, Issue.assigned_worker_id == User.id)
             .filter(Issue.status == 'resolved')
-            .group_by(Worker.id, Worker.name)
+            .group_by(User.id, User.name)
             .order_by(func.count(Issue.id).desc())
             .limit(10)
             .all()
@@ -338,4 +343,3 @@ def get_cache_key(endpoint: str, filters: dict) -> str:
 #     ...
 
 
-print('[Stream 7] Backend optimization endpoints loaded')

@@ -39,7 +39,7 @@ from slowapi.util import get_remote_address
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.database import SessionLocal, check_db_connection, engine, dispose_pool
-from app.routes import admin, auth, chat, citizen_features, complaints, features, issues, locations, notifications, public, rewards, setup, sync, workers
+from app.routes import admin, auth, chat, citizen_features, complaints, features, issues, locations, notifications, optimization, public, rewards, setup, sync, workers
 from app.services.pool_monitor import PoolHealthCheckThread
 from app.services.utils import get_users_by_role, get_users_with_roles
 
@@ -388,4 +388,5 @@ app.include_router(chat.router)
 app.include_router(locations.router)
 app.include_router(rewards.router)
 app.include_router(sync.router)  # offline sync
+app.include_router(optimization.router)  # query optimization & performance
 app.include_router(public.router)
