@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      # Persist local uploads between restarts
+      - uploads_data:/app/uploads
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers ${UVICORN_WORKERS:-2}
+      --limit-concurrency 100
+      --timeout-keep-alive 30
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Development profile — adds --reload and mounts source code
+  api-dev:
+    build: .
+    env_file: .env
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - .:/app
+      - uploads_data:/app/uploads
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-include "*.py"
+      --reload-include ".env"
+    profiles:
+      - dev
+    restart: unless-stopped
+
+volumes:
+  uploads_data:

@@ -1,0 +1,45 @@
+# Secrets — never bake into image
+.env
+.env.*
+!.env.example
+
+# Credentials
+credentials/
+*-adminsdk-*.json
+*serviceAccountKey*.json
+*client_secret*.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Dev / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Logs & uploads (mounted as volumes at runtime)
+logs/
+uploads/
+*.log
+
+# Tests & docs
+test_api.py
+*.md
+git_commands.md
