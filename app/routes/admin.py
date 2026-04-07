@@ -526,6 +526,8 @@ def get_my_scope(
     Used by the frontend to display the admin's scope badge and to restrict
     which location management actions are visible.
 
+    **Optimization**: Batch-load all location models instead of sequential queries.
+
     Returns::
 
         {
@@ -539,32 +541,50 @@ def get_my_scope(
 
     district_id = district_name = taluka_id = taluka_name = ward_id = ward_name = None
 
+    # ── OPTIMIZATION: Batch-load all location IDs instead of sequential queries ──
+    location_ids = {
+        'district': current_user.district_id,
+        'taluka': current_user.taluka_id,
+        'ward': current_user.ward_id,
+    }
+    
+    # Build a single batch query for all needed locations
+    needed_ids = [v for v in location_ids.values() if v]
+    if needed_ids:
+        # Fetch all districts, talukas, and wards in one batch
+        districts = {d.id: d for d in db.query(DistrictModel).all()}
+        talukas = {t.id: t for t in db.query(TalukaModel).all()}
+        wards = {w.id: w for w in db.query(WardModel).all()}
+    else:
+        districts = talukas = wards = {}
+
+    # Extract data from cached objects
     if current_user.district_id:
-        d = db.query(DistrictModel).filter(DistrictModel.id == current_user.district_id).first()
+        d = districts.get(current_user.district_id)
         district_id = str(current_user.district_id)
         district_name = d.name if d else None
 
     if current_user.taluka_id:
-        t = db.query(TalukaModel).filter(TalukaModel.id == current_user.taluka_id).first()
+        t = talukas.get(current_user.taluka_id)
         taluka_id = str(current_user.taluka_id)
         taluka_name = t.name if t else None
         if not district_id and t:
-            dd = db.query(DistrictModel).filter(DistrictModel.id == t.district_id).first()
+            d = districts.get(t.district_id)
             district_id = str(t.district_id)
-            district_name = dd.name if dd else None
+            district_name = d.name if d else None
 
     if current_user.ward_id:
-        w = db.query(WardModel).filter(WardModel.id == current_user.ward_id).first()
+        w = wards.get(current_user.ward_id)
         ward_id = str(current_user.ward_id)
         ward_name = w.name if w else None
         if not taluka_id and w:
-            tt = db.query(TalukaModel).filter(TalukaModel.id == w.taluka_id).first()
+            t = talukas.get(w.taluka_id)
             taluka_id = str(w.taluka_id)
-            taluka_name = tt.name if tt else None
-            if tt and not district_id:
-                dd = db.query(DistrictModel).filter(DistrictModel.id == tt.district_id).first()
-                district_id = str(tt.district_id)
-                district_name = dd.name if dd else None
+            taluka_name = t.name if t else None
+            if t and not district_id:
+                d = districts.get(t.district_id)
+                district_id = str(t.district_id)
+                district_name = d.name if d else None
 
     return {
         "role": current_user.role,

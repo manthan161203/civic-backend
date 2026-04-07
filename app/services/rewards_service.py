@@ -351,7 +351,10 @@ def get_leaderboard(db: Session, role: str = "citizen", limit: int = 10, offset:
 # ── Badge unlock checks ───────────────────────────────────────────────────────
 
 def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: str) -> None:
-    """After awarding points, check if any new badges should be unlocked."""
+    """After awarding points, check if any new badges should be unlocked.
+    
+    **Optimization**: Single grouped query instead of N queries per badge check.
+    """
     from app.models.reward import RewardTransaction, UserBadge
     from app.models.user import User
 
@@ -361,6 +364,30 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
 
     # Badges already earned (don't re-award)
     earned = {b.badge_key for b in db.query(UserBadge).filter(UserBadge.user_id == user_id).all()}
+
+    # ── OPTIMIZATION: Single query to get all event type counts ──
+    from sqlalchemy import func
+    event_counts = (
+        db.query(
+            RewardTransaction.event_type,
+            func.count(RewardTransaction.id).label("count"),
+            func.sum(RewardTransaction.points).label("total_points"),
+        )
+        .filter(RewardTransaction.user_id == user_id)
+        .group_by(RewardTransaction.event_type)
+        .all()
+    )
+    
+    # Convert to dict for O(1) lookup
+    counts = {row[0]: {"count": row[1], "points": row[2] or 0} for row in event_counts}
+    
+    def _get_count(event_type: str) -> int:
+        """Get count for an event type from pre-fetched counts."""
+        return counts.get(event_type, {}).get("count", 0)
+
+    def _get_points_sum(event_type: str) -> int:
+        """Get total points for an event type from pre-fetched counts."""
+        return counts.get(event_type, {}).get("points", 0)
 
     def _grant(key: str):
         if key not in earned:
@@ -375,11 +402,8 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
     try:
         # ── Citizen badge checks ──────────────────────────────────────────────
         if user.role in ("citizen",):
-            issue_count = db.query(func.count(RewardTransaction.id)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "report_issue",
-            ).scalar() or 0
-
+            issue_count = _get_count("report_issue")
+            
             if issue_count >= 1:
                 _grant("first_report")
             if issue_count >= 10:
@@ -391,29 +415,20 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
             if triggered_by_event == "aadhar_verified":
                 _grant("verified_citizen")
 
-            # Community voice: total votes_received >= 50
-            total_votes = db.query(func.sum(RewardTransaction.points)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "vote_received",
-            ).scalar() or 0
-            if total_votes >= 250:  # 50 votes × 5 pts
+            # Community voice: total votes_received >= 250 points (50 votes × 5 pts)
+            total_votes = _get_points_sum("vote_received")
+            if total_votes >= 250:
                 _grant("community_voice")
 
             # Engaged citizen: rated 10 issues
-            rating_count = db.query(func.count(RewardTransaction.id)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "rate_issue",
-            ).scalar() or 0
+            rating_count = _get_count("rate_issue")
             if rating_count >= 10:
                 _grant("engaged_citizen")
 
         # ── Worker badge checks ───────────────────────────────────────────────
         elif user.role == "worker":
-            resolve_count = db.query(func.count(RewardTransaction.id)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "resolve_issue",
-            ).scalar() or 0
-
+            resolve_count = _get_count("resolve_issue")
+            
             if resolve_count >= 1:
                 _grant("first_resolution")
             if resolve_count >= 10:
@@ -422,26 +437,17 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
                 _grant("resolver_100")
 
             # Fast responder: 10 fast_resolve events
-            fast_count = db.query(func.count(RewardTransaction.id)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "fast_resolve",
-            ).scalar() or 0
+            fast_count = _get_count("fast_resolve")
             if fast_count >= 10:
                 _grant("fast_responder")
 
             # Top rated: 20 five-star ratings
-            five_star_count = db.query(func.count(RewardTransaction.id)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "five_star_rating",
-            ).scalar() or 0
+            five_star_count = _get_count("five_star_rating")
             if five_star_count >= 20:
                 _grant("top_rated")
 
             # Streak master: 4 weekly_streak events
-            streak_count = db.query(func.count(RewardTransaction.id)).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == "weekly_streak",
-            ).scalar() or 0
+            streak_count = _get_count("weekly_streak")
             if streak_count >= 4:
                 _grant("streak_master")
 

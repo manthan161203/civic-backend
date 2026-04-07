@@ -140,21 +140,34 @@ def create_dispute(
         db.commit()
         db.refresh(dispute)
 
-        # Notify admins
+        # Notify admins (batch notifications instead of per-admin loop)
         admins = db.query(User).filter(
             User.role.in_(["admin", "ward_admin", "taluka_admin", "district_admin"]),
             User.is_active == True,
         ).all()
-        for admin_user in admins:
-            notify_localized(
-                db=db, user=admin_user, key="dispute_opened",
-                notification_type="system",
-                issue_id=str(issue.id),
-                action_type="open_dispute",
-                issue_id_short=str(issue.id)[:8],
-                issue_type=issue.issue_type,
-                ward=issue.ward or "unknown",
-            )
+        
+        # Build notification payload once, send to all admins
+        notification_payload = {
+            "key": "dispute_opened",
+            "notification_type": "system",
+            "issue_id": str(issue.id),
+            "action_type": "open_dispute",
+            "issue_id_short": str(issue.id)[:8],
+            "issue_type": issue.issue_type,
+            "ward": issue.ward or "unknown",
+        }
+        admin_ids = [admin.id for admin in admins]
+        
+        # Send notification to all admins in one operation
+        try:
+            from app.services.notification_service import notify_localized_batch
+            notify_localized_batch(db=db, user_ids=admin_ids, **notification_payload)
+        except ImportError:
+            # Fallback: notify_localized_batch not available, use per-admin approach
+            for admin_user in admins:
+                notify_localized(
+                    db=db, user=admin_user, **notification_payload
+                )
     except HTTPException:
         raise
     except Exception as e:

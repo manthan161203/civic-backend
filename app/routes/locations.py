@@ -558,15 +558,29 @@ def get_full_tree(db: Session = Depends(get_db)):
     """Return the full State → District → Taluka → Ward tree. **Public.**
 
     Useful for cascading dropdowns on the registration screen.
+    
+    **Optimization**: Single joined query instead of N+1 cascading queries.
     """
-    districts = db.query(District).order_by(District.name).all()
+    from sqlalchemy.orm import joinedload
+    
+    # Single query fetching all districts with their talukas and wards via joins
+    districts = (
+        db.query(District)
+        .options(
+            joinedload(District.talukas).joinedload(Taluka.wards)
+        )
+        .order_by(District.name)
+        .all()
+    )
+    
     result = []
     for d in districts:
         talukas_data = []
-        for t in db.query(Taluka).filter(Taluka.district_id == d.id).order_by(Taluka.name).all():
+        # Talukas are already loaded via joinedload, no additional query
+        for t in sorted(d.talukas, key=lambda x: x.name):
             wards_data = [
                 _ward_out(w)
-                for w in db.query(Ward).filter(Ward.taluka_id == t.id).order_by(Ward.ward_number).all()
+                for w in sorted(t.wards, key=lambda x: x.ward_number)
             ]
             talukas_data.append({**_taluka_out(t), "wards": wards_data})
         result.append({**_district_out(d), "talukas": talukas_data})

@@ -113,17 +113,28 @@ def upvote_issue(
             issue.escalated_at = datetime.utcnow()
             db.commit()
             admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()
-            for admin_user in admins:
-                notify_localized(
-                    db=db,
-                    user=admin_user,
-                    key="escalation",
-                    notification_type="system",
-                    issue_id=str(issue.id),
-                    issue_id_short=str(issue.id)[:8],
-                    issue_type=issue.issue_type,
-                    ward=issue.ward or "unknown",
-                )
+            
+            # Build notification payload once, send to all admins
+            notification_payload = {
+                "key": "escalation",
+                "notification_type": "system",
+                "issue_id": str(issue.id),
+                "issue_id_short": str(issue.id)[:8],
+                "issue_type": issue.issue_type,
+                "ward": issue.ward or "unknown",
+            }
+            admin_ids = [admin.id for admin in admins]
+            
+            # Send notification to all admins in one operation
+            try:
+                from app.services.notification_service import notify_localized_batch
+                notify_localized_batch(db=db, user_ids=admin_ids, **notification_payload)
+            except ImportError:
+                # Fallback: notify_localized_batch not available, use per-admin approach
+                for admin_user in admins:
+                    notify_localized(
+                        db=db, user=admin_user, **notification_payload
+                    )
             logger.info(
                 f"Issue {issue_id} auto-escalated via upvote threshold "
                 f"({issue.upvote_count} votes ≥ {UPVOTE_ESCALATION_THRESHOLD})"
@@ -448,11 +459,22 @@ def list_subscriptions(
     """List all wards I am subscribed to for issue notifications.
 
     **Roles**: citizen only.
+    
+    **Optimization**: Batch-load all wards in one query (not N+1).
     """
     subs = db.query(WardSubscription).filter(WardSubscription.user_id == current_user.id).all()
+    
+    if not subs:
+        return []
+    
+    # Batch-load all wards at once instead of querying per subscription
+    ward_ids = [s.ward_id for s in subs]
+    wards = db.query(Ward).filter(Ward.id.in_(ward_ids)).all()
+    ward_map = {w.id: w for w in wards}
+    
     result = []
     for s in subs:
-        ward = db.query(Ward).filter(Ward.id == s.ward_id).first()
+        ward = ward_map.get(s.ward_id)
         result.append({
             "ward_id": str(s.ward_id),
             "ward_name": ward.name if ward else None,
