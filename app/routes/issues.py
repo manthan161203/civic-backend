@@ -1581,53 +1581,8 @@ def delete_comment(
     logger.info(f"Comment {comment_id} deleted by user {current_user.id}")
 
 
-@router.post("/{issue_id}/upvote", status_code=status.HTTP_200_OK)
-def upvote_issue(
-    issue_id: uuid.UUID,
-    current_user: User = Depends(require_role("citizen", "admin")),
-    db: Session = Depends(get_db),
-):
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
-
-    existing_vote = db.query(IssueVote).filter(
-        IssueVote.issue_id == issue_id,
-        IssueVote.user_id == current_user.id
-    ).first()
-
-    if existing_vote:
-        return {"success": True, "message": "Already upvoted."}
-
-    vote = IssueVote(issue_id=issue.id, user_id=current_user.id)
-    db.add(vote)
-    issue.upvote_count += 1
-    db.commit()
-    return {"success": True}
-
-
-@router.delete("/{issue_id}/upvote", status_code=status.HTTP_200_OK)
-def remove_upvote_issue(
-    issue_id: uuid.UUID,
-    current_user: User = Depends(require_role("citizen", "admin")),
-    db: Session = Depends(get_db),
-):
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
-
-    vote = db.query(IssueVote).filter(
-        IssueVote.issue_id == issue_id,
-        IssueVote.user_id == current_user.id
-    ).first()
-
-    if not vote:
-        return {"success": True, "message": "Not upvoted."}
-
-    db.delete(vote)
-    issue.upvote_count -= 1
-    db.commit()
-    return {"success": True}
+# NOTE: Upvote POST/DELETE endpoints are defined in features.py with
+# rewards integration and auto-escalation logic.
 
 
 # ───────────────────────────────────────────────────────────────────────────────

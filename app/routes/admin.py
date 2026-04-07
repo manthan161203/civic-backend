@@ -34,11 +34,13 @@ from app.core.deps import apply_admin_scope, require_any_admin, require_role
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.announcement import Announcement
+from app.models.geofence import Geofence
 from app.models.issue import Issue
 from app.models.issue_flag import IssueFlag
 from app.models.user import User
 from app.schemas.admin import (
-    AssignWorker, CreateWorker, DashboardStats, UpdateWorker, UpdateSubAdmin
+    AssignWorker, CreateWorker, CreateGeofenceRequest, DashboardStats, 
+    GeofenceListResponse, GeofenceResponse, UpdateWorker, UpdateSubAdmin, UpdateGeofenceRequest
 )
 from app.schemas.auth import UserResponse
 from app.schemas.issue import IssueListResponse, IssueResponse
@@ -1877,6 +1879,220 @@ def get_squad(
     except Exception as e:
         logger.error(f"Error fetching squad: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch squad.")
+
+
+# ── Geofences ─────────────────────────────────────────────────────────────────
+
+@router.get("/geofences", response_model=GeofenceListResponse)
+def list_geofences(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=200),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """List all geofences with pagination.
+    
+    **Roles**: admin or district_admin.
+    
+    Args:
+        page: Page number (1-indexed), default 1
+        size: Items per page (1-200), default 20
+    
+    Returns:
+        GeofenceListResponse with items, total, page, size
+    """
+    try:
+        query = db.query(Geofence)
+        total = query.count()
+        
+        geofences = (
+            query
+            .order_by(Geofence.created_at.desc(), Geofence.id.desc())
+            .offset((page - 1) * size)
+            .limit(size)
+            .all()
+        )
+        
+        items = []
+        for gf in geofences:
+            items.append(GeofenceResponse(
+                id=gf.id,
+                name=gf.name,
+                latitude=gf.latitude,
+                longitude=gf.longitude,
+                radius_km=gf.radius_km,
+                created_by_name=gf.created_by.name if gf.created_by else None,
+                created_at=gf.created_at,
+            ))
+        
+        return GeofenceListResponse(
+            items=items,
+            total=total,
+            page=page,
+            size=size,
+        )
+    except Exception as e:
+        logger.error(f"Error listing geofences: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch geofences.")
+
+
+@router.post("/geofences", response_model=GeofenceResponse, status_code=status.HTTP_201_CREATED)
+def create_geofence(
+    body: CreateGeofenceRequest,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Create a new geofence zone.
+    
+    **Roles**: admin or district_admin.
+    
+    Args:
+        body: CreateGeofenceRequest with name, latitude, longitude, radius_km
+    
+    Returns:
+        Created GeofenceResponse
+    """
+    try:
+        # Validate input
+        if not body.name or not body.name.strip():
+            raise HTTPException(status_code=400, detail="Zone name is required")
+        
+        if body.latitude < -90 or body.latitude > 90:
+            raise HTTPException(status_code=400, detail="Latitude must be between -90 and 90")
+        
+        if body.longitude < -180 or body.longitude > 180:
+            raise HTTPException(status_code=400, detail="Longitude must be between -180 and 180")
+        
+        if body.radius_km <= 0:
+            raise HTTPException(status_code=400, detail="Radius must be greater than 0")
+        
+        # Create geofence
+        geofence = Geofence(
+            id=uuid.uuid4(),
+            name=body.name.strip(),
+            latitude=body.latitude,
+            longitude=body.longitude,
+            radius_km=body.radius_km,
+            created_by_id=current_user.id,
+        )
+        
+        db.add(geofence)
+        db.commit()
+        db.refresh(geofence)
+        
+        logger.info(f"Admin {current_user.id} created geofence {geofence.id}: {geofence.name}")
+        
+        return GeofenceResponse(
+            id=geofence.id,
+            name=geofence.name,
+            latitude=geofence.latitude,
+            longitude=geofence.longitude,
+            radius_km=geofence.radius_km,
+            created_by_name=current_user.name,
+            created_at=geofence.created_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating geofence: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create geofence.")
+
+
+@router.patch("/geofences/{geofence_id}", response_model=GeofenceResponse)
+def update_geofence(
+    geofence_id: uuid.UUID,
+    body: UpdateGeofenceRequest,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Update a geofence zone (all fields optional).
+    
+    **Roles**: admin or district_admin.
+    
+    Args:
+        geofence_id: UUID of the geofence to update
+        body: UpdateGeofenceRequest with optional fields
+    
+    Returns:
+        Updated GeofenceResponse
+    """
+    try:
+        geofence = db.query(Geofence).filter(Geofence.id == geofence_id).first()
+        if not geofence:
+            raise HTTPException(status_code=404, detail="Geofence not found")
+        
+        # Update fields if provided
+        if body.name is not None:
+            if not body.name or not body.name.strip():
+                raise HTTPException(status_code=400, detail="Zone name cannot be empty")
+            geofence.name = body.name.strip()
+        
+        if body.latitude is not None:
+            if body.latitude < -90 or body.latitude > 90:
+                raise HTTPException(status_code=400, detail="Latitude must be between -90 and 90")
+            geofence.latitude = body.latitude
+        
+        if body.longitude is not None:
+            if body.longitude < -180 or body.longitude > 180:
+                raise HTTPException(status_code=400, detail="Longitude must be between -180 and 180")
+            geofence.longitude = body.longitude
+        
+        if body.radius_km is not None:
+            if body.radius_km <= 0:
+                raise HTTPException(status_code=400, detail="Radius must be greater than 0")
+            geofence.radius_km = body.radius_km
+        
+        db.commit()
+        db.refresh(geofence)
+        
+        logger.info(f"Admin {current_user.id} updated geofence {geofence.id}")
+        
+        return GeofenceResponse(
+            id=geofence.id,
+            name=geofence.name,
+            latitude=geofence.latitude,
+            longitude=geofence.longitude,
+            radius_km=geofence.radius_km,
+            created_by_name=geofence.created_by.name if geofence.created_by else None,
+            created_at=geofence.created_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating geofence {geofence_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update geofence.")
+
+
+@router.delete("/geofences/{geofence_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_geofence(
+    geofence_id: uuid.UUID,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Delete a geofence zone.
+    
+    **Roles**: admin or district_admin.
+    
+    Args:
+        geofence_id: UUID of the geofence to delete
+    """
+    try:
+        geofence = db.query(Geofence).filter(Geofence.id == geofence_id).first()
+        if not geofence:
+            raise HTTPException(status_code=404, detail="Geofence not found")
+        
+        db.delete(geofence)
+        db.commit()
+        
+        logger.info(f"Admin {current_user.id} deleted geofence {geofence.id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting geofence {geofence_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete geofence.")
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ Admins review and resolve complaints from their dashboard.
 import uuid
 
 from sqlalchemy import Column, DateTime, Enum, ForeignKey, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -41,7 +41,7 @@ class WorkerComplaint(Base):
         nullable=False,
     )
     description = Column(Text, nullable=False)
-    photos = Column(JSON, default=list, nullable=False)
+    photos = Column(JSONB, default=list, nullable=False)
     status = Column(
         Enum("pending", "investigating", "resolved", "dismissed", name="complaint_status"),
         nullable=False,

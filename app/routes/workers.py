@@ -70,31 +70,7 @@ def update_worker_status(
     return {"is_online": current_user.is_online}
 
 
-@router.put("/availability", response_model=dict)
-def update_worker_availability(
-    body: dict,
-    current_user: User = Depends(require_role("worker")),
-    db: Session = Depends(get_db),
-):
-    """Toggle whether a worker is accepting new task assignments.
-
-    **Roles**: worker.
-
-    Returns:
-        ``{"is_available": true/false}``
-    """
-    try:
-        current_user.is_available = bool(body.get("is_available", True))
-        db.commit()
-    except Exception as e:
-        logger.error(f"Error updating availability for worker {current_user.id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update availability. Please try again.",
-        )
-
-    logger.info(f"Worker {current_user.id} availability changed to {current_user.is_available}")
-    return {"is_available": current_user.is_available}
+# NOTE: PUT /availability endpoint is defined in features.py with typed Pydantic model.
 
 
 @router.get("/leaderboard", response_model=list[dict])

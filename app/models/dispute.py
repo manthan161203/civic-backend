@@ -11,7 +11,7 @@ Status flow: open → under_review → accepted → rejected
 import uuid
 
 from sqlalchemy import Column, DateTime, Enum, ForeignKey, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -34,7 +34,7 @@ class Dispute(Base):
         index=True,
     )
     reason = Column(Text, nullable=False)
-    photos = Column(JSON, default=list, nullable=False)
+    photos = Column(JSONB, default=list, nullable=False)
     status = Column(
         Enum("open", "under_review", "accepted", "rejected", name="dispute_status"),
         nullable=False,

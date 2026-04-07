@@ -1,6 +1,7 @@
 from app.models.announcement import Announcement
 from app.models.custom_issue_type import CustomIssueType
 from app.models.dispute import Dispute
+from app.models.geofence import Geofence
 from app.models.issue import Issue
 from app.models.issue_bookmark import IssueBookmark
 from app.models.issue_comment import IssueComment
@@ -26,6 +27,7 @@ __all__ = [
     "WorkerComplaint",
     "Notification",
     "Announcement",
+    "Geofence",
     "WardSubscription",
     "WorkerShift",
     "RewardTransaction", "UserBadge",
