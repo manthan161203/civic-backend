@@ -167,37 +167,83 @@ def reassign_worker(
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """Reassign an issue to a different worker. **Roles**: any admin."""
+    """Reassign an issue to a different worker.
+    
+    Validates:
+    - Worker role must be 'worker'
+    - Worker must be active, online, and accepting tasks
+    - Worker must be in admin's jurisdiction
+    - Worker workload < 100 active tasks
+    - Worker must NOT be in the issue's rejected_by_ids list
+    
+    **Roles**: any admin.
+    """
+    # STEP 1: Verify issue exists in admin's jurisdiction
     issue = apply_admin_scope(db.query(Issue), current_user, Issue).filter(Issue.id == issue_id).first()
     if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
-
-    # Get worker and verify active status
-    new_worker = db.query(User).filter(User.id == body.worker_id, User.role == "worker").first()
-    if not new_worker or not new_worker.is_active:
-        raise HTTPException(status_code=404, detail="Worker not found or not in your jurisdiction")
+        raise HTTPException(status_code=404, detail="Issue not found or not in your jurisdiction")
     
+    # STEP 2: Fetch worker and verify ROLE
+    worker = db.query(User).filter(User.id == body.worker_id).first()
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if worker.role != "worker":
+        raise HTTPException(status_code=400, detail="User is not a worker")
+    
+    # STEP 3: Verify worker is ACTIVE
+    if not worker.is_active:
+        raise HTTPException(status_code=400, detail="Worker is inactive or suspended")
+    
+    # STEP 4: Verify worker is ONLINE
+    if not worker.is_online:
+        raise HTTPException(status_code=400, detail="Worker is offline (not connected)")
+    
+    # STEP 5: Verify worker is AVAILABLE (accepting new tasks)
+    if not worker.is_available:
+        raise HTTPException(status_code=400, detail="Worker is not accepting new assignments")
+    
+    # STEP 6: Verify worker is in JURISDICTION (admin's scope)
     scope = _user_scope_filter(current_user)
-    if scope and not all(getattr(new_worker, attr.key) == val for attr, val in zip(scope, scope)):
-        raise HTTPException(status_code=404, detail="Worker not found or not in your jurisdiction")
-
+    if scope and not all(getattr(worker, attr.key) == val for attr, val in zip(scope, scope)):
+        raise HTTPException(status_code=403, detail="Worker is not in your administrative jurisdiction")
+    
+    # STEP 7: Check worker's WORKLOAD (active task count)
+    active_task_count = db.query(Issue).filter(
+        Issue.assigned_worker_id == worker.id,
+        Issue.status.in_(["assigned", "in_progress"])
+    ).count()
+    if active_task_count >= 100:
+        raise HTTPException(status_code=400, detail=f"Worker has {active_task_count} active tasks (limit: 100)")
+    
+    # STEP 8: Verify worker NOT in REJECTED_BY_IDS (didn't reject this issue)
+    rejected_list = issue.rejected_by_ids or []
+    if str(worker.id) in [str(rid) for rid in rejected_list]:
+        raise HTTPException(status_code=400, detail="This worker previously rejected this issue")
+    
+    # STEP 9: Perform reassignment
     try:
         old_worker_id = issue.assigned_worker_id
-        issue.assigned_worker_id = new_worker.id
+        issue.assigned_worker_id = worker.id
         issue.status = "assigned"
         db.commit()
         db.refresh(issue)
-
+        
+        # Notify new worker
         from app.services.notification_service import notify_localized
-        notify_localized(db=db, user=new_worker, key="assignment", notification_type="assignment",
-                         issue_id=str(issue.id), issue_type=issue.issue_type, ward=issue.ward or "your area")
+        notify_localized(
+            db=db, user=worker, key="assignment", notification_type="assignment",
+            issue_id=str(issue.id), issue_type=issue.issue_type, ward=issue.ward or "your area"
+        )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error reassigning issue {issue_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to reassign issue.")
-
-    logger.info(f"Admin {current_user.id} reassigned issue {issue_id} from {old_worker_id} to {new_worker.id}")
+    
+    logger.info(
+        f"Admin {current_user.id} reassigned issue {issue_id} from {old_worker_id} to {worker.id}",
+        extra={"old_worker_id": str(old_worker_id), "new_worker_id": str(worker.id), "active_tasks": active_task_count}
+    )
     return IssueResponse.model_validate(issue)
 
 
@@ -208,35 +254,76 @@ def assign_worker(
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """Manually assign a worker to an issue. **Roles**: any admin."""
+    """Manually assign a worker to an issue.
+    
+    Validates:
+    - Worker role must be 'worker'
+    - Worker must be active, online, and accepting tasks
+    - Worker must be in admin's jurisdiction
+    - Worker workload < 100 active tasks
+    
+    **Roles**: any admin.
+    """
+    # STEP 1: Verify issue exists in admin's jurisdiction
     issue = apply_admin_scope(db.query(Issue), current_user, Issue).filter(Issue.id == issue_id).first()
     if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
-
-    worker_q = db.query(User).filter(User.id == body.worker_id, User.role == "worker")
-    worker_q = apply_active_filter(worker_q)
-    scope = _user_scope_filter(current_user)
-    if scope:
-        worker_q = worker_q.filter(*scope)
-    worker = worker_q.first()
+        raise HTTPException(status_code=404, detail="Issue not found or not in your jurisdiction")
+    
+    # STEP 2: Fetch worker and verify ROLE
+    worker = db.query(User).filter(User.id == body.worker_id).first()
     if not worker:
-        raise HTTPException(status_code=404, detail="Worker not found or not in your jurisdiction")
-
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if worker.role != "worker":
+        raise HTTPException(status_code=400, detail="User is not a worker")
+    
+    # STEP 3: Verify worker is ACTIVE
+    if not worker.is_active:
+        raise HTTPException(status_code=400, detail="Worker is inactive or suspended")
+    
+    # STEP 4: Verify worker is ONLINE
+    if not worker.is_online:
+        raise HTTPException(status_code=400, detail="Worker is offline (not connected)")
+    
+    # STEP 5: Verify worker is AVAILABLE (accepting new tasks)
+    if not worker.is_available:
+        raise HTTPException(status_code=400, detail="Worker is not accepting new assignments")
+    
+    # STEP 6: Verify worker is in JURISDICTION (admin's scope)
+    scope = _user_scope_filter(current_user)
+    if scope and not all(getattr(worker, attr.key) == val for attr, val in zip(scope, scope)):
+        raise HTTPException(status_code=403, detail="Worker is not in your administrative jurisdiction")
+    
+    # STEP 7: Check worker's WORKLOAD (active task count)
+    active_task_count = db.query(Issue).filter(
+        Issue.assigned_worker_id == worker.id,
+        Issue.status.in_(["assigned", "in_progress"])
+    ).count()
+    if active_task_count >= 100:
+        raise HTTPException(status_code=400, detail=f"Worker has {active_task_count} active tasks (limit: 100)")
+    
+    # STEP 8: Perform assignment
     try:
         issue.assigned_worker_id = worker.id
         issue.status = "assigned"
         db.commit()
         db.refresh(issue)
+        
+        # Notify worker
         from app.services.notification_service import notify_localized
         notify_localized(
             db=db, user=worker, key="assignment", notification_type="assignment",
             issue_id=str(issue.id), issue_type=issue.issue_type, ward=issue.ward or "your area",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error assigning worker to issue {issue_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to assign worker.")
-
-    logger.info(f"Admin {current_user.id} assigned worker {worker.id} to issue {issue_id}")
+    
+    logger.info(
+        f"Admin {current_user.id} assigned worker {worker.id} to issue {issue_id}",
+        extra={"worker_id": str(worker.id), "active_tasks": active_task_count}
+    )
     return IssueResponse.model_validate(issue)
 
 

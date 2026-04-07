@@ -383,11 +383,38 @@ def upsert_shift(
     """Create or update the shift for a given day.
 
     If a shift already exists for that day, it is updated (upsert).
+    
+    Validates:
+    - start_time < end_time
+    - shift duration ≤ 12 hours (maximum)
 
     **Roles**: worker only.
     """
+    # STEP 1: Validate start_time < end_time
     if body.start_time >= body.end_time:
         raise HTTPException(status_code=400, detail="start_time must be before end_time")
+    
+    # STEP 2: Validate maximum 12-hour shift duration
+    try:
+        start_h, start_m = map(int, body.start_time.split(":"))
+        end_h, end_m = map(int, body.end_time.split(":"))
+        
+        start_minutes = start_h * 60 + start_m
+        end_minutes = end_h * 60 + end_m
+        
+        # Handle shift that crosses midnight (e.g., 22:00 to 06:00 next day)
+        if end_minutes <= start_minutes:
+            end_minutes += 24 * 60  # Add 24 hours
+        
+        duration_hours = (end_minutes - start_minutes) / 60
+        
+        if duration_hours > 12:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Shift duration ({duration_hours:.1f} hours) exceeds maximum of 12 hours"
+            )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid time format (expected HH:MM)")
 
     try:
         existing = db.query(WorkerShift).filter(
@@ -412,6 +439,8 @@ def upsert_shift(
 
         db.commit()
         db.refresh(shift)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error upserting shift: {e}", exc_info=True)
