@@ -751,6 +751,8 @@ def block_task(
     try:
         issue.is_blocked = True
         issue.blocked_reason = reason
+        issue.blocked_at = datetime.utcnow()
+        issue.blocked_by_id = current_user.id
         issue.status = "in_progress"
         db.commit()
         db.refresh(issue)

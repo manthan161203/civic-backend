@@ -247,6 +247,264 @@ def reassign_worker(
     return IssueResponse.model_validate(issue)
 
 
+@router.post("/issues/{issue_id}/unblock", response_model=IssueResponse)
+def unblock_task(
+    issue_id: uuid.UUID,
+    admin_notes: str = Query(..., min_length=1, max_length=500, description="Why task is being unblocked"),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin unblocks a task and clears the blocked flag.
+    
+    Updates:
+    - is_blocked → false
+    - unblocked_at → now
+    - unblocked_by_id → current admin
+    - admin_unblock_note → provided reason
+    - block_resolved_by → 'unblock'
+    
+    Notifies assigned worker that block is cleared.
+    
+    **Roles**: any admin.
+    """
+    issue = apply_admin_scope(db.query(Issue), current_user, Issue).filter(Issue.id == issue_id).first()
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found or not in your jurisdiction")
+    
+    if not issue.is_blocked:
+        raise HTTPException(status_code=400, detail="Task is not blocked")
+    
+    try:
+        issue.is_blocked = False
+        issue.unblocked_at = datetime.utcnow()
+        issue.unblocked_by_id = current_user.id
+        issue.admin_unblock_note = admin_notes
+        issue.block_resolved_by = "unblock"
+        db.commit()
+        db.refresh(issue)
+        
+        # Notify assigned worker that block is cleared
+        if issue.assigned_worker:
+            from app.services.notification_service import notify_localized
+            notify_localized(
+                db=db,
+                user=issue.assigned_worker,
+                key="unblocked",
+                notification_type="status_update",
+                issue_id=str(issue.id),
+                issue_type=issue.issue_type,
+                admin_note=admin_notes[:100],  # Truncate for notification
+                ward=issue.ward or "your area"
+            )
+        
+        logger.info(
+            f"Admin {current_user.id} unblocked issue {issue_id}. "
+            f"Reason: {admin_notes}",
+            extra={"issue_id": str(issue_id), "admin_id": str(current_user.id)}
+        )
+    except Exception as e:
+        logger.error(f"Error unblocking issue {issue_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to unblock task")
+    
+    return IssueResponse.model_validate(issue)
+
+
+@router.get("/blocked-tasks", response_model=IssueListResponse)
+def list_blocked_tasks(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    sort: str = Query("blocked_duration", description="blocked_duration | blocked_at | status"),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """List all blocked tasks in admin's jurisdiction.
+    
+    Filters: is_blocked=true
+    Sorting: by block duration (oldest first) or other fields
+    
+    **Roles**: any admin.
+    """
+    from datetime import datetime, timezone
+    
+    base_query = apply_admin_scope(db.query(Issue), current_user, Issue)
+    base_query = base_query.filter(Issue.is_blocked == True)
+    
+    # Apply sorting
+    if sort == "blocked_at":
+        base_query = base_query.order_by(Issue.blocked_at.asc())  # oldest first
+    elif sort == "status":
+        base_query = base_query.order_by(Issue.status, Issue.blocked_at.asc())
+    else:  # blocked_duration (default)
+        base_query = base_query.order_by(Issue.blocked_at.asc())  # oldest = longest duration
+    
+    total = base_query.count()
+    issues = base_query.limit(limit).offset(offset).all()
+    
+    # Enrich with block duration
+    responses = []
+    for issue in issues:
+        resp = IssueResponse.model_validate(issue)
+        if issue.blocked_at:
+            blocked_duration = (datetime.now(timezone.utc) - issue.blocked_at).total_seconds() / 3600
+            resp.blocked_duration_hours = round(blocked_duration, 1)
+        responses.append(resp)
+    
+    return IssueListResponse(items=responses, total=total, limit=limit, offset=offset)
+
+
+@router.post("/issues/{issue_id}/respond-to-block", response_model=IssueResponse)
+def respond_to_block(
+    issue_id: uuid.UUID,
+    message: str = Query(..., min_length=1, max_length=500, description="Message to worker about block"),
+    resources_provided: str = Query("", description="Comma-separated list of resources provided"),
+    can_proceed: bool = Query(False, description="Whether worker can now proceed"),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin responds to a blocked task without clearing the block.
+    
+    Use this endpoint when:
+    - Acknowledging the block
+    - Informing worker of provided resources
+    - Providing partial resolution
+    - Asking for more information
+    
+    Does NOT clear is_blocked flag. Worker can still call unblock if resolved.
+    
+    **Roles**: any admin.
+    """
+    issue = apply_admin_scope(db.query(Issue), current_user, Issue).filter(Issue.id == issue_id).first()
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found or not in your jurisdiction")
+    
+    if not issue.is_blocked:
+        raise HTTPException(status_code=400, detail="Task is not blocked")
+    
+    try:
+        # Create or append admin response in resolution_notes
+        response_text = f"\n[Admin Response from {current_user.name or current_user.id}]: {message}"
+        if resources_provided:
+            response_text += f"\nResources provided: {resources_provided}"
+        if can_proceed:
+            response_text += "\n✓ You can proceed with the task."
+        
+        if issue.resolution_notes:
+            issue.resolution_notes = issue.resolution_notes + response_text
+        else:
+            issue.resolution_notes = response_text
+        
+        db.commit()
+        db.refresh(issue)
+        
+        # Notify assigned worker of response
+        if issue.assigned_worker:
+            from app.services.notification_service import notify_localized
+            notify_localized(
+                db=db,
+                user=issue.assigned_worker,
+                key="block_response",
+                notification_type="status_update",
+                issue_id=str(issue.id),
+                message=message[:150],
+                can_proceed=can_proceed,
+                ward=issue.ward or "your area"
+            )
+        
+        logger.info(
+            f"Admin {current_user.id} responded to blocked issue {issue_id}. "
+            f"Can proceed: {can_proceed}",
+            extra={"issue_id": str(issue_id), "admin_id": str(current_user.id), "can_proceed": can_proceed}
+        )
+    except Exception as e:
+        logger.error(f"Error responding to block on issue {issue_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to respond to block")
+    
+    return IssueResponse.model_validate(issue)
+
+
+@router.post("/blocked-tasks/bulk-unblock", response_model=dict)
+def bulk_unblock_tasks(
+    issue_ids: list = Query(..., description="List of issue IDs to unblock"),
+    admin_notes: str = Query(..., min_length=1, max_length=500, description="Reason for bulk unblock"),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Bulk unblock multiple tasks at once.
+    
+    Use for:
+    - Disaster scenarios (e.g., "equipment now available for all")
+    - Policy changes
+    - Bulk resource allocation
+    
+    Validates each issue is:
+    - In admin's jurisdiction
+    - Currently blocked
+    
+    Returns count of successfully unblocked tasks.
+    
+    **Roles**: any admin.
+    """
+    if not issue_ids or len(issue_ids) == 0:
+        raise HTTPException(status_code=400, detail="At least one issue ID required")
+    
+    if len(issue_ids) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 issues per bulk operation")
+    
+    unblocked_count = 0
+    errors = []
+    
+    for issue_id_str in issue_ids:
+        try:
+            issue_id = uuid.UUID(issue_id_str)
+            issue = apply_admin_scope(db.query(Issue), current_user, Issue).filter(
+                Issue.id == issue_id
+            ).first()
+            
+            if not issue:
+                errors.append(f"{issue_id_str}: not found or not in jurisdiction")
+                continue
+            
+            if not issue.is_blocked:
+                errors.append(f"{issue_id_str}: not blocked")
+                continue
+            
+            # Unblock the task
+            issue.is_blocked = False
+            issue.unblocked_at = datetime.utcnow()
+            issue.unblocked_by_id = current_user.id
+            issue.admin_unblock_note = admin_notes
+            issue.block_resolved_by = "bulk_unblock"
+            unblocked_count += 1
+        except ValueError:
+            errors.append(f"{issue_id_str}: invalid UUID format")
+            continue
+        except Exception as e:
+            logger.error(f"Error unblocking {issue_id_str}: {e}")
+            errors.append(f"{issue_id_str}: error during unblock")
+            continue
+    
+    # Batch commit
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Bulk unblock commit failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to commit bulk unblock")
+    
+    logger.info(
+        f"Admin {current_user.id} bulk unblocked {unblocked_count}/{len(issue_ids)} tasks. "
+        f"Reason: {admin_notes}",
+        extra={"admin_id": str(current_user.id), "count": unblocked_count, "total": len(issue_ids)}
+    )
+    
+    return {
+        "unblocked_count": unblocked_count,
+        "total_requested": len(issue_ids),
+        "errors": errors,
+        "message": f"Successfully unblocked {unblocked_count} task(s)"
+    }
+
+
 @router.post("/issues/{issue_id}/assign", response_model=IssueResponse)
 def assign_worker(
     issue_id: uuid.UUID,

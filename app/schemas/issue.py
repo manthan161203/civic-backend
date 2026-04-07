@@ -248,6 +248,13 @@ class IssueResponse(BaseModel):
     escalation_level: int = 0
     is_blocked: bool
     blocked_reason: Optional[str] = None
+    blocked_at: Optional[datetime] = None
+    blocked_by_id: Optional[UUID] = None
+    unblocked_at: Optional[datetime] = None
+    unblocked_by_id: Optional[UUID] = None
+    admin_unblock_note: Optional[str] = None
+    block_resolved_by: Optional[str] = None
+    blocked_duration_hours: Optional[float] = None  # Calculated on retrieval
     reassignment_count: int = 0
     is_deleted: bool = False
     is_sos: bool = False
@@ -267,11 +274,11 @@ class IssueListResponse(BaseModel):
     Attributes:
         items: List of issues for the current page.
         total: Total number of issues matching the filters.
-        page:  Current page number (1-indexed).
-        size:  Number of items per page.
+        limit: Number of items per page (limit parameter).
+        offset: Starting position (offset parameter).
     """
 
     items: List[IssueResponse]
     total: int
-    page: int
-    size: int
+    limit: int = 50
+    offset: int = 0

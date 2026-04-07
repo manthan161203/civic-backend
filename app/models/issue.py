@@ -104,9 +104,17 @@ class Issue(Base):
     is_sos = Column(Boolean, default=False, nullable=False)
     sos_radius_notified = Column(Boolean, default=False, nullable=False)  # True once nearby citizens alerted
 
-    # Blocked by worker
-    is_blocked = Column(Boolean, default=False, nullable=False)
+    # Blocked by worker — with admin resolution tracking
+    is_blocked = Column(Boolean, default=False, nullable=False, index=True)
     blocked_reason = Column(Text, nullable=True)
+    blocked_at = Column(DateTime(timezone=True), nullable=True)  # When worker blocked
+    blocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)  # Worker who blocked
+    
+    # Admin unblock tracking
+    unblocked_at = Column(DateTime(timezone=True), nullable=True)  # When admin unblocked
+    unblocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)  # Admin who unblocked
+    admin_unblock_note = Column(Text, nullable=True)  # Admin's reason for unblocking
+    block_resolved_by = Column(String(50), nullable=True)  # 'reassign' | 'unblock' | 'resolve' | 'other'
 
     # Rejection tracking — auto-escalates after 3 rejections
     reassignment_count = Column(Integer, server_default="0", nullable=False)
