@@ -126,15 +126,15 @@ class Settings(BaseSettings):
     AADHAR_KYC_ACCOUNT_ID: str = ""         # IDfy only
 
     # CORS
-    CORS_ORIGINS: str = ""                  # Empty = reject all origins (safest); set to explicit URLs in production
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001"
 
-    DEV_MODE: bool = False                  # Set True only for local development
+    DEV_MODE: bool = True                   # Set True only for local development
 
     # Rate limiting
     RATE_LIMIT_PER_MINUTE: int = 60         # default requests/min per IP
 
     # Environment and version
-    ENVIRONMENT: str = "production"         # development or production
+    ENVIRONMENT: str = "development"        # development or production
     APP_VERSION: str = "1.0.0"             # Application version
 
     model_config = {"env_file": ".env"}
