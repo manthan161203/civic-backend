@@ -1,3 +1,4 @@
+from app.models.admin_override import AdminOverride
 from app.models.announcement import Announcement
 from app.models.custom_issue_type import CustomIssueType
 from app.models.dispute import Dispute
@@ -27,6 +28,7 @@ __all__ = [
     "WorkerComplaint",
     "Notification",
     "Announcement",
+    "AdminOverride",
     "Geofence",
     "WardSubscription",
     "WorkerShift",

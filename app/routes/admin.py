@@ -1992,7 +1992,8 @@ def change_user_role(
 class GrantOverrideRequest(BaseModel):
     """Request to grant override access to another admin."""
     target_admin_id: uuid.UUID = Field(..., description="Admin to grant override to")
-    target_scope: str = Field(..., description="Scope to grant access to (e.g., 'ward:123', 'taluka:456')")
+    scope_level: str = Field(..., description="Scope level: 'ward', 'taluka', 'district'")
+    target_scope_id: uuid.UUID = Field(..., description="UUID of the location/scope")
     reason: str = Field(..., description="Reason for override (incident ID, emergency, etc.)")
     duration_minutes: Optional[int] = Field(None, description="How long override lasts (None = permanent)")
 
@@ -2012,6 +2013,8 @@ def grant_override_access(
     
     **Roles**: super-admin only.
     """
+    from app.models import AdminOverride
+    
     # Verify target admin exists
     target_admin = db.query(User).filter(
         User.id == body.target_admin_id,
@@ -2020,29 +2023,55 @@ def grant_override_access(
     if not target_admin:
         raise HTTPException(status_code=404, detail="Target admin not found")
     
+    # Validate scope level
+    if body.scope_level not in ["ward", "taluka", "district"]:
+        raise HTTPException(status_code=400, detail="Invalid scope_level. Must be 'ward', 'taluka', or 'district'")
+    
     try:
-        # Log the override grant
-        override_log = log_override_access(
-            admin=target_admin,
-            target_scope=body.target_scope,
+        # Calculate override expiry time
+        override_until = None
+        if body.duration_minutes:
+            override_until = datetime.utcnow() + timedelta(minutes=body.duration_minutes)
+        
+        # Create the AdminOverride entry
+        override = AdminOverride(
+            id=uuid.uuid4(),
+            granted_by_admin_id=current_user.id,
+            granted_to_admin_id=body.target_admin_id,
+            scope_level=body.scope_level,
+            target_scope_id=body.target_scope_id,
             reason=body.reason,
-            resource_type="cross_scope_access",
+            override_until=override_until,
+        )
+        
+        db.add(override)
+        db.commit()
+        db.refresh(override)
+        
+        # Also log to audit trail
+        log_override_access(
+            admin=target_admin,
+            target_scope=f"{body.scope_level}:{body.target_scope_id}",
+            reason=body.reason,
+            resource_type="override_grant",
             duration_minutes=body.duration_minutes,
             db=db
         )
         
         logger.info(
             f"Super-admin {current_user.id} granted override to {target_admin.id} "
-            f"for scope {body.target_scope}. Reason: {body.reason}",
+            f"for {body.scope_level}:{body.target_scope_id}. Reason: {body.reason}",
             extra={"audit": True}
         )
         
         return {
             "status": "success",
-            "override_id": str(override_log.id),
-            "message": f"Override granted until {override_log.override_until or 'revoked manually'}",
+            "override_id": str(override.id),
+            "message": f"Override granted until {override.override_until or 'manually revoked'}",
             "target_admin": target_admin.name,
-            "target_scope": body.target_scope,
+            "scope_level": body.scope_level,
+            "target_scope_id": str(body.target_scope_id),
+            "expires_at": override.override_until.isoformat() if override.override_until else None,
         }
     except Exception as e:
         logger.error(f"Error granting override: {e}", exc_info=True)
@@ -2052,6 +2081,8 @@ def grant_override_access(
 @router.get("/overrides/active")
 def list_active_overrides(
     admin_id: Optional[uuid.UUID] = Query(None, description="Filter by admin"),
+    page: int = Query(1, ge=1, description="Page number"),
+    size: int = Query(20, ge=1, le=100, description="Page size"),
     current_user: User = Depends(require_role("admin")),
     db: Session = Depends(get_db),
 ):
@@ -2059,37 +2090,46 @@ def list_active_overrides(
     
     **Roles**: super-admin only.
     """
+    from app.models import AdminOverride, User as UserModel
+    
     try:
+        # Build query for active overrides
+        query = db.query(AdminOverride).filter(
+            AdminOverride.revoked_at.is_(None),  # Not revoked
+            (AdminOverride.override_until.is_(None)) |  # Permanent or
+            (AdminOverride.override_until > datetime.utcnow())  # Not expired
+        )
+        
         if admin_id:
-            overrides = get_active_overrides(admin_id, db)
-        else:
-            # Get all active overrides for all admins
-            from app.services.admin_override import AdminOverrideLog
-            overrides = (
-                db.query(AdminOverrideLog)
-                .filter(
-                    (AdminOverrideLog.override_until.is_(None)) |
-                    (AdminOverrideLog.override_until > datetime.utcnow())
-                )
-                .order_by(AdminOverrideLog.created_at.desc())
-                .all()
-            )
+            query = query.filter(AdminOverride.granted_to_admin_id == admin_id)
+        
+        # Count total
+        total = query.count()
+        
+        # Apply pagination
+        overrides = query.order_by(AdminOverride.created_at.desc()).offset((page - 1) * size).limit(size).all()
+        
+        # Build response with admin names
+        override_list = []
+        for o in overrides:
+            # Get admin names
+            granted_to = db.query(UserModel).filter(UserModel.id == o.granted_to_admin_id).first()
+            
+            override_list.append({
+                "id": str(o.id),
+                "admin_name": granted_to.name if granted_to else "Unknown",
+                "target_scope": f"{o.scope_level}:{o.target_scope_id}",
+                "reason": o.reason,
+                "override_until": o.override_until.isoformat() if o.override_until else None,
+            })
         
         return {
             "status": "success",
-            "count": len(overrides),
-            "overrides": [
-                {
-                    "id": str(o.id),
-                    "admin_id": str(o.admin_id),
-                    "admin_role": o.admin_role,
-                    "target_scope": o.target_scope,
-                    "reason": o.reason,
-                    "created_at": o.created_at.isoformat(),
-                    "expires_at": o.override_until.isoformat() if o.override_until else None,
-                }
-                for o in overrides
-            ]
+            "count": len(override_list),
+            "total": total,
+            "page": page,
+            "size": size,
+            "items": override_list
         }
     except Exception as e:
         logger.error(f"Error listing active overrides: {e}", exc_info=True)
@@ -2106,25 +2146,33 @@ def revoke_admin_override(
     
     **Roles**: super-admin only.
     """
+    from app.models import AdminOverride
+    
     try:
-        from app.services.admin_override import AdminOverrideLog
-        
-        override_log = db.query(AdminOverrideLog).filter(AdminOverrideLog.id == override_id).first()
-        if not override_log:
+        override = db.query(AdminOverride).filter(AdminOverride.id == override_id).first()
+        if not override:
             raise HTTPException(status_code=404, detail="Override not found")
         
-        revoke_override(override_id, db)
+        if override.revoked_at:
+            raise HTTPException(status_code=400, detail="Override is already revoked")
+        
+        # Update revocation fields
+        override.revoked_at = datetime.utcnow()
+        override.revoked_by = current_user.id
+        db.commit()
+        db.refresh(override)
         
         logger.info(
             f"Super-admin {current_user.id} revoked override {override_id} "
-            f"for admin {override_log.admin_id}",
+            f"for admin {override.granted_to_admin_id}",
             extra={"audit": True}
         )
         
         return {
             "status": "success",
             "message": "Override successfully revoked",
-            "override_id": str(override_id)
+            "override_id": str(override_id),
+            "revoked_at": override.revoked_at.isoformat()
         }
     except HTTPException:
         raise
@@ -2136,7 +2184,8 @@ def revoke_admin_override(
 @router.get("/overrides/audit-log")
 def get_override_audit_log(
     admin_id: Optional[uuid.UUID] = Query(None, description="Filter by admin"),
-    days: int = Query(30, ge=7, le=90, description="Days of history to retrieve"),
+    page: int = Query(1, ge=1, description="Page number"),
+    size: int = Query(50, ge=1, le=100, description="Page size"),
     current_user: User = Depends(require_role("admin")),
     db: Session = Depends(get_db),
 ):
@@ -2144,26 +2193,40 @@ def get_override_audit_log(
     
     **Roles**: super-admin only.
     """
+    from app.services.admin_override import AdminOverrideLog
+    
     try:
-        overrides = get_override_log(admin_id=admin_id, days=days, db=db)
+        # Build query for audit logs
+        query = db.query(AdminOverrideLog).order_by(AdminOverrideLog.created_at.desc())
+        
+        if admin_id:
+            query = query.filter(AdminOverrideLog.admin_id == admin_id)
+        
+        # Count total
+        total = query.count()
+        
+        # Apply pagination
+        logs = query.offset((page - 1) * size).limit(size).all()
         
         return {
             "status": "success",
-            "count": len(overrides),
-            "days": days,
-            "audit_log": [
+            "count": len(logs),
+            "total": total,
+            "page": page,
+            "size": size,
+            "items": [
                 {
                     "id": str(o.id),
                     "admin_id": str(o.admin_id),
                     "admin_role": o.admin_role,
                     "target_scope": o.target_scope,
+                    "accessed_resource_type": o.accessed_resource_type,
                     "reason": o.reason,
-                    "resource_type": o.accessed_resource_type,
                     "created_at": o.created_at.isoformat(),
                     "expires_at": o.override_until.isoformat() if o.override_until else None,
                     "is_active": o.override_until is None or o.override_until > datetime.utcnow()
                 }
-                for o in overrides
+                for o in logs
             ]
         }
     except Exception as e:

@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logger import get_logger
 from app.database import Base
-from app.models import User
+from app.models import User, AdminOverride
 
 logger = get_logger(__name__)
 
@@ -71,24 +71,29 @@ def can_admin_override_access(
     if admin.role == "admin":
         return True
     
-    # Build target scope string
+    # Determine target scope level and ID
     if target_ward_id:
-        target_scope = f"ward:{target_ward_id}"
+        scope_level = "ward"
+        target_scope_id = target_ward_id
     elif target_taluka_id:
-        target_scope = f"taluka:{target_taluka_id}"
+        scope_level = "taluka"
+        target_scope_id = target_taluka_id
     elif target_district_id:
-        target_scope = f"district:{target_district_id}"
+        scope_level = "district"
+        target_scope_id = target_district_id
     else:
         return False
     
     # Check if admin has active override for this scope
     active_override = (
-        db.query(AdminOverrideLog)
+        db.query(AdminOverride)
         .filter(
-            AdminOverrideLog.admin_id == admin.id,
-            AdminOverrideLog.target_scope == target_scope,
-            (AdminOverrideLog.override_until.is_(None)) |
-            (AdminOverrideLog.override_until > datetime.utcnow())
+            AdminOverride.granted_to_admin_id == admin.id,
+            AdminOverride.scope_level == scope_level,
+            AdminOverride.target_scope_id == target_scope_id,
+            AdminOverride.revoked_at.is_(None),  # Not revoked
+            (AdminOverride.override_until.is_(None)) |  # Permanent or
+            (AdminOverride.override_until > datetime.utcnow())  # Not expired
         )
         .first()
     )
