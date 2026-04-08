@@ -27,9 +27,16 @@ class AssignWorker(BaseModel):
 
 
 class CreateWorker(BaseModel):
-    """Request body for ``POST /admin/workers``."""
+    """Request body for ``POST /admin/workers``.
+
+    On creation:
+    - A temporary password is auto-generated and sent via email
+    - The worker account starts as inactive (is_active=False)
+    - The worker must change their password within 7 days
+    """
 
     phone: str = Field(..., description="Worker's phone number (must be unique)")
+    email: str = Field(..., description="Worker's email address (must be unique, used for invitation)")
     name: Optional[str] = Field(None, description="Worker's display name")
     ward: Optional[str] = Field(None, description="Ward name string (legacy, for display)")
     ward_id: Optional[UUID] = Field(None, description="Structured ward UUID (from /locations)")

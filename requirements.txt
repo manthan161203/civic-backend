@@ -1,6 +1,7 @@
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
 aiosignal==1.4.0
+aiosmtplib==5.1.0
 alembic==1.18.4
 annotated-doc==0.0.4
 annotated-types==0.7.0

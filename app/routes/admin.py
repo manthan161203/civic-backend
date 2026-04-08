@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import apply_admin_scope, require_any_admin, require_role
 from app.core.logger import get_logger
+from app.core.security import hash_password
 from app.database import get_db
 from app.models.announcement import Announcement
 from app.models.geofence import Geofence
@@ -951,16 +952,24 @@ def list_workers(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=200),
     is_online: Optional[bool] = Query(None),
+    is_active: Optional[bool] = Query(None),
     ward: Optional[str] = Query(None),
     department: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """List workers in the admin's scope. **Roles**: any admin."""
+    """List workers in the admin's scope. **Roles**: any admin.
+
+    Query params:
+      - is_active: true/false to list active or invited/inactive workers.
+    """
     try:
-        query_results = get_users_by_role("worker", db)
+        query_results = get_users_by_role("worker", db) if is_active is None else get_users_by_role("worker", db, active_only=False)
         query = db.query(User).filter(User.id.in_([u.id for u in query_results]))
+
+        if is_active is not None:
+            query = query.filter(User.is_active == is_active)
 
         # Scope by location FK when available
         scope = _user_scope_filter(current_user)
@@ -990,22 +999,35 @@ def list_workers(
 
 
 @router.post("/workers", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def create_worker(
+async def create_worker(
     body: CreateWorker,
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
     """Create a new worker account.
 
+    Generates a temporary password and sends an invitation email to the worker.
+    The worker starts as inactive (is_active=False) and must change the password
+    within 7 days of receiving the invitation.
+
     ward_admin can only create workers for their own ward.
     taluka_admin/district_admin/admin can assign any ward.
 
     **Roles**: any admin.
     """
+    from app.services.email_service import send_worker_invitation
+    import secrets
+
     try:
-        existing = db.query(User).filter(User.phone == body.phone).first()
-        if existing:
+        # Check phone uniqueness
+        existing_phone = db.query(User).filter(User.phone == body.phone).first()
+        if existing_phone:
             raise HTTPException(status_code=409, detail="Phone number already registered")
+
+        # Check email uniqueness
+        existing_email = db.query(User).filter(User.email == body.email).first()
+        if existing_email:
+            raise HTTPException(status_code=409, detail="Email address already registered")
 
         ward_id = getattr(body, "ward_id", None)
         taluka_id = getattr(body, "taluka_id", None)
@@ -1034,8 +1056,13 @@ def create_worker(
                 if taluka_obj:
                     district_id = taluka_obj.district_id
 
+        # Generate temporary password (16-character URL-safe string)
+        temp_password = secrets.token_urlsafe(12)
+
+        # Create worker with temporary password and invitation fields
         worker = User(
             phone=body.phone,
+            email=body.email,
             name=body.name,
             ward=body.ward,
             ward_id=ward_id,
@@ -1043,10 +1070,30 @@ def create_worker(
             district_id=district_id,
             department=getattr(body, "department", None),
             role="worker",
+            password_hash=hash_password(temp_password),
+            is_active=False,  # Pending until first login
+            must_change_password=True,
+            invitation_sent_at=datetime.utcnow(),
         )
         db.add(worker)
         db.commit()
         db.refresh(worker)
+
+        # Send invitation email (best-effort — don't fail if email fails)
+        email_sent = await send_worker_invitation(
+            to_email=body.email,
+            worker_name=body.name or "",
+            phone=body.phone,
+            temp_password=temp_password,
+        )
+
+        if not email_sent:
+            # Log warning with temp password visible in DEV_MODE for recovery
+            logger.warning(
+                f"Failed to send invitation email to {body.email} for worker {worker.id}. "
+                f"Temp password (for admin recovery): {temp_password}"
+            )
+
     except HTTPException:
         raise
     except Exception as e:

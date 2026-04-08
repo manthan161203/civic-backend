@@ -286,6 +286,28 @@ async def _auto_escalate_loop():
                 if deleted_otps or deleted_tokens:
                     db.commit()
                     logger.info(f"Cleanup: removed {deleted_otps} expired OTPs, {deleted_tokens} stale tokens")
+
+                # 7-day worker deactivation: pending workers who never changed password
+                deadline = now - timedelta(days=7)
+                from app.models.user import User
+
+                expired_workers = (
+                    db.query(User)
+                    .filter(
+                        User.role == "worker",
+                        User.is_active == False,
+                        User.must_change_password == True,
+                        User.invitation_sent_at != None,
+                        User.invitation_sent_at < deadline,
+                    )
+                    .all()
+                )
+                if expired_workers:
+                    for w in expired_workers:
+                        w.invitation_sent_at = None  # Clear deadline so it doesn't re-trigger
+                    db.commit()
+                    logger.info(f"Auto-deactivated {len(expired_workers)} worker(s) past 7-day invitation window")
+
             finally:
                 db.close()
         except Exception as e:

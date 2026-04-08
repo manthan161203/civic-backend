@@ -72,6 +72,13 @@ class User(Base):
     aadhar_hash = Column(String(64), unique=True, nullable=True, index=True)  # SHA-256 of Aadhar number
     aadhar_verified = Column(Boolean, default=False, nullable=False)
 
+    # Password-based auth (nullable for OTP/OAuth-only users)
+    password_hash = Column(String, nullable=True)
+
+    # Worker invitation tracking (pending workers who haven't changed password yet)
+    must_change_password = Column(Boolean, default=False, nullable=False)
+    invitation_sent_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
     # Worker live location (updated by worker app)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)

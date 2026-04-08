@@ -103,6 +103,19 @@ class Settings(BaseSettings):
     # Push notifications — Firebase FCM
     FIREBASE_CREDENTIALS_PATH: str = "credentials/firebase-adminsdk.json"
 
+    # Email — SMTP (worker invitation, password reset)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "noreply@civicapp.in"
+    SMTP_TLS: bool = True
+
+    # App URLs and support (used in worker invitation emails)
+    APP_DOWNLOAD_URL: str = "https://civicapp.in/download"
+    APP_HELP_URL: str = "https://civicapp.in/help"
+    SUPPORT_EMAIL: str = "support@civicapp.in"
+
     # Google OAuth (mobile: client sends id_token, backend verifies signature)
     GOOGLE_CLIENT_ID: str = ""
 

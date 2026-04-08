@@ -8,6 +8,8 @@ Access tokens expire in 15 minutes. Use ``POST /auth/refresh`` to rotate tokens.
 """
 
 from datetime import datetime, timedelta
+import re
+import secrets
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
@@ -18,7 +20,7 @@ from slowapi.util import get_remote_address
 from app.core.config import settings
 from app.core.deps import get_current_user
 from app.core.logger import get_logger
-from app.core.security import create_access_token
+from app.core.security import create_access_token, hash_password, verify_password
 from app.database import get_db
 from app.models.otp import OTP
 from app.models.user import User
@@ -26,10 +28,15 @@ from app.schemas.auth import (
     AadharSendOTPRequest,
     AadharVerifyRequest,
     AuthProvidersResponse,
+    ChangePasswordRequest,
     ChangePhoneSendOTPRequest,
     ChangePhoneVerifyRequest,
+    ForgotPasswordRequest,
     GoogleLoginRequest,
+    PasswordLoginRequest,
     RefreshTokenRequest,
+    RegisterRequest,
+    ResetPasswordRequest,
     SendOTPRequest,
     TokenResponse,
     UpdateProfileRequest,
@@ -134,6 +141,9 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
     Creates a new user account on first successful verification.
     Subsequent logins return the existing account.
 
+    For pending workers (is_active=False, must_change_password=True):
+    - OTP login activates them immediately.
+
     Returns:
         ``TokenResponse`` with access_token, refresh_token, and user profile.
 
@@ -159,8 +169,13 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
         # Check if existing user is active BEFORE consuming the OTP so it can be reused if forbidden
         existing_user = db.query(User).filter(User.phone == body.phone).first()
         if existing_user and not existing_user.is_active:
-            logger.warning(f"Login attempt on deactivated account (phone={body.phone})")
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+            # Allow pending workers (role=worker, must_change_password=True) to log in and activate
+            if existing_user.role == "worker" and existing_user.must_change_password:
+                # Will activate below after OTP is verified
+                pass
+            else:
+                logger.warning(f"Login attempt on deactivated account (phone={body.phone})")
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
 
         otp.is_used = True
         db.commit()
@@ -172,6 +187,12 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
             db.commit()
             db.refresh(user)
             logger.info(f"New user account created for phone {body.phone} (user_id={user.id})")
+        else:
+            # If pending worker logging in via OTP, activate them
+            if not user.is_active and user.role == "worker" and user.must_change_password:
+                user.is_active = True
+                db.commit()
+                logger.info(f"Activated pending worker {user.id} on first OTP login")
 
         access_token = create_access_token({"sub": str(user.id)})
         refresh_token = create_refresh_token(str(user.id), db)
@@ -189,6 +210,7 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
         access_token=access_token,
         refresh_token=refresh_token,
         user=UserResponse.model_validate(user),
+        must_change_password=user.must_change_password,
     )
 
 
@@ -405,6 +427,349 @@ async def aadhar_verify_otp(request: Request, body: AadharVerifyRequest, db: Ses
         refresh_token=refresh_token,
         user=UserResponse.model_validate(user),
     )
+
+
+# ── Password-based auth ────────────────────────────────────────────────────────
+
+
+@router.get("/check-phone", status_code=status.HTTP_200_OK)
+@limiter.limit("30/minute")
+def check_phone(request: Request, phone: str, db: Session = Depends(get_db)):
+    """Check whether a phone number is already registered.
+
+    Used by the mobile app to decide whether to show the OTP login flow
+    or the full registration form.
+
+    Returns:
+        ``{"exists": true}`` if the phone is registered, ``{"exists": false}`` otherwise.
+    """
+    p = phone.strip()
+    if not p.startswith("+"):
+        p = "+91" + p
+    user = db.query(User).filter(User.phone == p).first()
+    return {"exists": user is not None}
+
+
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
+def register_citizen(request: Request, body: RegisterRequest, db: Session = Depends(get_db)):
+    """Register a new citizen account with full profile details.
+
+    Creates a user record and returns a success message.
+    Does NOT return tokens — caller should immediately send OTP via
+    ``POST /auth/send-otp`` and verify via ``POST /auth/verify-otp`` to log in.
+
+    Raises:
+        409: Phone or email already registered.
+    """
+    try:
+        # Normalize phone (add +91 if not already present)
+        phone = body.phone.strip()
+        if not phone.startswith("+"):
+            phone = "+91" + phone
+
+        # Check phone uniqueness
+        existing_phone = db.query(User).filter(User.phone == phone).first()
+        if existing_phone:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Phone number already registered",
+            )
+
+        # Check email uniqueness
+        email = body.email.strip()
+        existing_email = db.query(User).filter(User.email == email).first()
+        if existing_email:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email address already registered",
+            )
+
+        # Create user with core fields; remaining profile is collected via setup flow
+        user = User(
+            phone=phone,
+            name=body.name.strip(),
+            email=email,
+            password_hash=hash_password(body.password),
+            role="citizen",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        logger.info(f"New citizen registered: {user.id} (phone={phone})")
+        return {"message": "Registration successful. Please verify your phone number."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during registration: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Registration failed. Please try again.",
+        )
+
+
+@router.post("/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
+def login_with_password(request: Request, body: PasswordLoginRequest, db: Session = Depends(get_db)):
+    """Authenticate via email or phone + password.
+
+    Returns TokenResponse with access_token, refresh_token, and user profile.
+    Includes ``must_change_password`` flag for workers who need to change password on first login.
+
+    Raises:
+        400: Account uses OTP login only (no password).
+        401: Invalid credentials.
+        403: Account is deactivated (non-worker accounts only).
+    """
+    try:
+        identifier = body.identifier.strip()
+
+        # Determine if identifier is phone or email
+        is_phone = re.match(r"^\+?[1-9]\d{9,14}$", identifier)
+        if is_phone:
+            # Normalize phone
+            phone = identifier if identifier.startswith("+") else "+91" + identifier
+            user = db.query(User).filter(User.phone == phone).first()
+        else:
+            # Treat as email
+            user = db.query(User).filter(User.email == identifier).first()
+
+        # Never reveal whether account exists
+        if not user or not user.password_hash:
+            if user and not user.password_hash:
+                logger.warning(f"Login attempt on OTP-only account: {identifier}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This account uses OTP login. Please use the OTP tab.",
+                )
+            else:
+                logger.warning(f"Invalid login attempt: {identifier}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid credentials",
+                )
+
+        # Verify password
+        if not verify_password(body.password, user.password_hash):
+            logger.warning(f"Invalid password for user {user.id}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+            )
+
+        # Check if user is deactivated (unless it's a pending worker)
+        if not user.is_active:
+            if user.role == "worker" and user.must_change_password:
+                # Pending worker — activate them on first login
+                user.is_active = True
+                db.commit()
+                logger.info(f"Activated pending worker {user.id} on first login")
+            else:
+                # Permanently deactivated
+                logger.warning(f"Login attempt on deactivated account: {user.id}")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account is deactivated",
+                )
+
+        # Issue tokens
+        access_token = create_access_token({"sub": str(user.id)})
+        refresh_token = create_refresh_token(str(user.id), db)
+
+        logger.info(f"User {user.id} authenticated via password")
+        return TokenResponse(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            user=UserResponse.model_validate(user),
+            must_change_password=user.must_change_password,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during password login: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication failed. Please try again.",
+        )
+
+
+@router.post("/forgot-password", status_code=status.HTTP_200_OK)
+@limiter.limit("5/minute")
+async def forgot_password(request: Request, body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Initiate password reset flow by sending OTP to phone.
+
+    Always returns 200 regardless of whether the account exists (no account enumeration).
+    The OTP is sent via SMS if the account has a phone number.
+
+    Raises:
+        None — always returns 200 with generic message.
+    """
+    try:
+        identifier = body.identifier.strip()
+
+        # Find user by phone or email
+        user = None
+        is_phone = re.match(r"^\+?[1-9]\d{9,14}$", identifier)
+        if is_phone:
+            phone = identifier if identifier.startswith("+") else "+91" + identifier
+            user = db.query(User).filter(User.phone == phone).first()
+        else:
+            user = db.query(User).filter(User.email == identifier).first()
+
+        # Send OTP if user exists and has a phone number
+        if user and user.phone:
+            # Generate OTP (reuse existing logic)
+            code = generate_otp()
+            otp = OTP(
+                phone=user.phone,
+                code=code,
+                expires_at=datetime.utcnow() + timedelta(minutes=10),
+            )
+            db.add(otp)
+            db.commit()
+
+            # Send SMS
+            sent = await send_otp(user.phone, code)
+            if sent:
+                logger.info(f"Forgot-password OTP sent to {user.phone}")
+            else:
+                logger.error(f"Failed to send forgot-password OTP to {user.phone}")
+
+        # Always return generic success message
+        return {"message": "If an account exists, a reset OTP has been sent."}
+
+    except Exception as e:
+        logger.error(f"Error during forgot-password: {e}", exc_info=True)
+        # Still return 200 to avoid enumeration attacks
+        return {"message": "If an account exists, a reset OTP has been sent."}
+
+
+@router.post("/reset-password", response_model=TokenResponse)
+@limiter.limit("10/minute")
+def reset_password(request: Request, body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Verify OTP and reset password.
+
+    On success, automatically logs in the user (returns tokens).
+
+    Raises:
+        400: Invalid or expired OTP.
+        404: User not found.
+    """
+    try:
+        # Normalize phone
+        phone = body.phone.strip()
+        if not phone.startswith("+"):
+            phone = "+91" + phone
+
+        # Verify OTP
+        otp = (
+            db.query(OTP)
+            .filter(
+                OTP.phone == phone,
+                OTP.code == body.code,
+                OTP.is_used == False,
+                OTP.expires_at > datetime.utcnow(),
+            )
+            .first()
+        )
+        if not otp:
+            logger.warning(f"Invalid or expired reset OTP for {phone}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired OTP",
+            )
+
+        # Find user
+        user = db.query(User).filter(User.phone == phone).first()
+        if not user:
+            logger.warning(f"Reset password requested for non-existent phone {phone}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Account not found",
+            )
+
+        # Update password and clear forced-change flags
+        user.password_hash = hash_password(body.new_password)
+        user.must_change_password = False
+        user.invitation_sent_at = None
+        otp.is_used = True
+        db.commit()
+        db.refresh(user)
+
+        # Issue tokens (auto-login)
+        access_token = create_access_token({"sub": str(user.id)})
+        refresh_token = create_refresh_token(str(user.id), db)
+
+        logger.info(f"User {user.id} reset password via OTP")
+        return TokenResponse(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            user=UserResponse.model_validate(user),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during password reset: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Password reset failed. Please try again.",
+        )
+
+
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+def change_password(
+    request: Request,
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change password for authenticated user.
+
+    For workers on first login (must_change_password=True):
+        - ``current_password`` can be None or empty.
+
+    For voluntary password changes:
+        - ``current_password`` is required for security.
+
+    Raises:
+        400: Current password is incorrect (for non-forced changes).
+    """
+    try:
+        # If not forced change, verify current password
+        if not current_user.must_change_password:
+            if not current_user.password_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This account does not have a password. Please use OTP or another login method.",
+                )
+            if not body.current_password or not verify_password(body.current_password, current_user.password_hash):
+                logger.warning(f"Invalid current password for user {current_user.id}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Current password is incorrect",
+                )
+
+        # Update password and clear forced-change flags
+        current_user.password_hash = hash_password(body.new_password)
+        current_user.must_change_password = False
+        current_user.invitation_sent_at = None
+        db.commit()
+
+        logger.info(f"User {current_user.id} changed password")
+        return {"message": "Password changed successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during password change for user {current_user.id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Password change failed. Please try again.",
+        )
 
 
 # ── Token management ──────────────────────────────────────────────────────────

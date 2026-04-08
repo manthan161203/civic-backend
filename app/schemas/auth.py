@@ -161,6 +161,7 @@ class UserResponse(BaseModel):
         google_id:       Google account ID if Google auth is linked (null otherwise).
         aadhar_verified: Whether the user has completed Aadhaar verification.
         profile_photo_url: URL to the user's profile photo (null if not set).
+        must_change_password: True if user must change password before using the app (workers on first login).
         created_at:      Timestamp when the user account was created.
     """
 
@@ -181,6 +182,7 @@ class UserResponse(BaseModel):
     google_id: Optional[str] = None
     aadhar_verified: bool = False
     profile_photo_url: Optional[str] = None
+    must_change_password: bool = False
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     created_at: datetime
@@ -198,12 +200,15 @@ class TokenResponse(BaseModel):
                        Use ``POST /auth/refresh`` to exchange it.
         token_type:    Always ``"bearer"``.
         user:          The authenticated user's profile.
+        must_change_password: True if the user must change their password before proceeding.
+                             This is set to True for workers on first login.
     """
 
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
     user: UserResponse
+    must_change_password: bool = False
 
 
 class RefreshTokenRequest(BaseModel):
@@ -309,6 +314,156 @@ class ChangePhoneVerifyRequest(BaseModel):
     def validate_code(cls, v: str) -> str:
         if not v.isdigit() or len(v) != 6:
             raise ValueError("OTP must be exactly 6 digits")
+        return v
+
+
+# ── Password-based auth ───────────────────────────────────────────────
+
+
+class RegisterRequest(BaseModel):
+    """Request body for ``POST /auth/register`` (citizen registration).
+
+    Creates a new user account with core fields.
+    Does NOT return tokens — user must log in afterward (via OTP or password).
+    Remaining profile fields (language, ward, location) are collected via the
+    in-app setup wizard after first login.
+
+    Attributes:
+        phone:            Phone number with country code.
+        name:             Full display name.
+        email:            Email address.
+        password:         Password for login (minimum 8 characters).
+        confirm_password: Must match password field.
+    """
+
+    phone: str = Field(..., examples=["+919876543210"], description="Phone number with country code")
+    name: str = Field(..., min_length=2, description="Full display name")
+    email: str = Field(..., examples=["user@example.com"], description="Email address")
+    password: str = Field(..., min_length=8, description="Password (minimum 8 characters)")
+    confirm_password: str = Field(..., description="Must match password field")
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        v = v.strip()
+        if not re.match(r"^\+?[1-9]\d{9,14}$", v):
+            raise ValueError("Invalid phone number. Must be 10-15 digits, optionally starting with +")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        v = v.strip()
+        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", v):
+            raise ValueError("Invalid email address")
+        return v
+
+    @field_validator("confirm_password")
+    @classmethod
+    def passwords_match(cls, v: str, info) -> str:
+        if info.data.get("password") != v:
+            raise ValueError("Passwords do not match")
+        return v
+
+
+class PasswordLoginRequest(BaseModel):
+    """Request body for ``POST /auth/login`` (password-based login).
+
+    Authenticate using either email or phone number + password.
+
+    Attributes:
+        identifier: Email address or phone number with country code.
+                   Example: ``"user@example.com"`` or ``"+919876543210"``
+        password: User's password.
+    """
+
+    identifier: str = Field(..., examples=["user@example.com"], description="Email or phone number")
+    password: str = Field(..., description="User password")
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Request body for ``POST /auth/forgot-password``.
+
+    Initiates a password reset flow by sending an OTP to the user's phone.
+    Always returns 200 regardless of whether the account exists (no account enumeration).
+
+    Attributes:
+        identifier: Email address or phone number registered with the account.
+    """
+
+    identifier: str = Field(..., examples=["user@example.com"], description="Registered email or phone number")
+
+
+class ResetPasswordRequest(BaseModel):
+    """Request body for ``POST /auth/reset-password``.
+
+    Verifies the OTP sent to the phone and sets a new password.
+    On success, automatically logs in the user (returns tokens).
+
+    Attributes:
+        phone: The phone number that received the reset OTP.
+        code: The 6-digit OTP code received via SMS.
+        new_password: The new password (minimum 8 characters).
+        confirm_password: Must match new_password.
+    """
+
+    phone: str = Field(..., examples=["+919876543210"], description="Phone number that received the OTP")
+    code: str = Field(..., examples=["123456"], description="6-digit OTP code")
+    new_password: str = Field(..., min_length=8, description="New password (minimum 8 characters)")
+    confirm_password: str = Field(..., description="Must match new_password")
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        v = v.strip()
+        if not re.match(r"^\+?[1-9]\d{9,14}$", v):
+            raise ValueError("Invalid phone number")
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        if not v.isdigit() or len(v) != 6:
+            raise ValueError("OTP must be exactly 6 digits")
+        return v
+
+    @field_validator("confirm_password")
+    @classmethod
+    def passwords_match(cls, v: str, info) -> str:
+        if info.data.get("new_password") != v:
+            raise ValueError("Passwords do not match")
+        return v
+
+
+class ChangePasswordRequest(BaseModel):
+    """Request body for ``POST /auth/change-password`` (authenticated).
+
+    Changes the password for the currently authenticated user.
+
+    When ``must_change_password`` is True (worker's first login):
+        - ``current_password`` should be None or empty (the temp password was already verified).
+        - The endpoint will not ask for the current password.
+
+    When ``must_change_password`` is False (voluntary password change):
+        - ``current_password`` is required for security verification.
+
+    Attributes:
+        current_password: Current password (required for voluntary changes, optional for forced).
+        new_password: The new password (minimum 8 characters).
+        confirm_password: Must match new_password.
+    """
+
+    current_password: Optional[str] = Field(
+        None, description="Current password (skip for first-time workers)"
+    )
+    new_password: str = Field(..., min_length=8, description="New password (minimum 8 characters)")
+    confirm_password: str = Field(..., description="Must match new_password")
+
+    @field_validator("confirm_password")
+    @classmethod
+    def passwords_match(cls, v: str, info) -> str:
+        if info.data.get("new_password") != v:
+            raise ValueError("Passwords do not match")
         return v
 
 
