@@ -984,8 +984,13 @@ def delete_account(
 ):
     """Soft-delete the current user's account.
 
-    Deactivates the account and revokes all refresh tokens.
-    Data is retained for audit purposes. Admins can reactivate via the admin panel.
+    Comprehensive cascade cleanup:
+    - Revokes all authentication tokens
+    - Cleans up all related records (notifications, subscriptions, comments, votes, etc.)
+    - Unassigns pending worker tasks
+    - Preserves issue records for audit purposes
+
+    **FIX: HIGH PRIORITY BUG #4 - Account deletion cascade comprehensive cleanup**
 
     Returns:
         ``{"message": "Account deleted successfully"}``
@@ -994,17 +999,109 @@ def delete_account(
         401: Not authenticated.
     """
     try:
-        revoke_all_user_tokens(str(current_user.id), db)
+        from app.models.notification import Notification
+        from app.models.issue import Issue
+        from app.models.issue_comment import IssueComment
+        from app.models.issue_vote import IssueVote
+        from app.models.issue_flag import IssueFlag
+        from app.models.ward_subscription import WardSubscription
+        from app.models.worker_complaint import WorkerComplaint
+        from app.models.worker_shift import WorkerShift
+        from app.models.reward import Reward
+        
+        user_id = current_user.id
+        
+        # 1. Revoke all authentication tokens
+        revoke_all_user_tokens(str(user_id), db)
+        logger.info(f"Revoked authentication tokens for user {user_id}")
+        
+        # 2. Clean up notifications (both sent to and from this user)
+        notif_count = db.query(Notification).filter(
+            Notification.user_id == user_id
+        ).delete()
+        logger.info(f"Deleted {notif_count} notifications for user {user_id}")
+        
+        # 3. Clean up issue comments authored by this user
+        comment_count = db.query(IssueComment).filter(
+            IssueComment.author_id == user_id
+        ).delete()
+        logger.info(f"Deleted {comment_count} issue comments for user {user_id}")
+        
+        # 4. Clean up issue votes (upvotes/downvotes)
+        vote_count = db.query(IssueVote).filter(
+            IssueVote.user_id == user_id
+        ).delete()
+        logger.info(f"Deleted {vote_count} issue votes for user {user_id}")
+        
+        # 5. Clean up issue flags (reported issues)
+        flag_count = db.query(IssueFlag).filter(
+            IssueFlag.flagger_id == user_id
+        ).delete()
+        logger.info(f"Deleted {flag_count} issue flags for user {user_id}")
+        
+        # 6. Clean up ward subscriptions (for citizens)
+        sub_count = db.query(WardSubscription).filter(
+            WardSubscription.citizen_id == user_id
+        ).delete()
+        logger.info(f"Deleted {sub_count} ward subscriptions for user {user_id}")
+        
+        # 7. Clean up worker complaints about this worker
+        complaint_count = db.query(WorkerComplaint).filter(
+            WorkerComplaint.worker_id == user_id
+        ).delete()
+        logger.info(f"Deleted {complaint_count} worker complaints for user {user_id}")
+        
+        # 8. Clean up worker shifts
+        shift_count = db.query(WorkerShift).filter(
+            WorkerShift.worker_id == user_id
+        ).delete()
+        logger.info(f"Deleted {shift_count} worker shifts for user {user_id}")
+        
+        # 9. Clean up reward records
+        reward_count = db.query(Reward).filter(
+            Reward.user_id == user_id
+        ).delete()
+        logger.info(f"Deleted {reward_count} reward records for user {user_id}")
+        
+        # 10. Unassign any unstarted tasks (status='assigned' or 'in_progress')
+        # These will be reassigned to 'open' so other workers can pick them up
+        pending_issues = db.query(Issue).filter(
+            Issue.assigned_worker_id == user_id,
+            Issue.status.in_(["assigned", "in_progress"])
+        ).all()
+        for issue in pending_issues:
+            issue.assigned_worker_id = None
+            issue.status = "open"
+        logger.info(f"Unassigned {len(pending_issues)} pending tasks for worker {user_id}")
+        
+        # 11. Mark account as inactive
         current_user.is_active = False
         db.commit()
+        
+        logger.info(
+            f"Account {user_id} permanently deactivated with comprehensive cascade cleanup",
+            extra={
+                "user_id": str(user_id), 
+                "role": current_user.role,
+                "notifications_deleted": notif_count,
+                "comments_deleted": comment_count,
+                "votes_deleted": vote_count,
+                "flags_deleted": flag_count,
+                "subscriptions_deleted": sub_count,
+                "complaints_deleted": complaint_count,
+                "shifts_deleted": shift_count,
+                "rewards_deleted": reward_count,
+                "pending_issues_unassigned": len(pending_issues)
+            }
+        )
     except Exception as e:
+        db.rollback()
         logger.error(f"Error deactivating account {current_user.id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Account deletion failed. Please try again.",
         )
 
-    logger.info(f"Account {current_user.id} deactivated (soft-delete)")
     return {"message": "Account deleted successfully"}
 
 

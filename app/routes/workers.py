@@ -344,12 +344,17 @@ def reject_task(
     if body.action != "reject":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="action must be 'reject'")
 
+    # Use FOR UPDATE lock to prevent concurrent rejections (race condition fix)
     issue = db.query(Issue).filter(
         Issue.id == issue_id,
         Issue.assigned_worker_id == current_user.id,
-    ).first()
+    ).with_for_update().first()
     if not issue:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found or not assigned to you")
+
+    # Verify status hasn't changed during lock acquisition
+    if issue.status not in ["assigned", "in_progress"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task cannot be rejected in current state")
 
     REJECTION_ESCALATION_THRESHOLD = 3  # auto-escalate after this many rejections
 
@@ -506,10 +511,11 @@ async def resolve_task(
         400: Task is not in ``in_progress`` status.
         404: Task not found or not assigned to this worker.
     """
+    # Use FOR UPDATE lock to prevent concurrent rejection/resolution
     issue = db.query(Issue).filter(
         Issue.id == issue_id,
         Issue.assigned_worker_id == current_user.id,
-    ).first()
+    ).with_for_update().first()
     if not issue:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found or not assigned to you")
 
@@ -545,13 +551,32 @@ async def resolve_task(
         issue.ai_resolution_quality = ai_result.get("resolution_quality")
         issue.ai_resolution_notes = ai_result.get("notes")
 
+        # Prepare all updates BEFORE first commit to ensure atomicity
         issue.status = "resolved"
         issue.resolved_at = datetime.utcnow()
         if resolution_notes:
             issue.resolution_notes = resolution_notes
 
+        # Single atomic commit for all issue updates
         db.commit()
         db.refresh(issue)
+
+        # Award points BEFORE notifying admins to prevent data inconsistency
+        try:
+            from app.services.rewards_service import award_event
+            award_event(db, current_user.id, "resolve_issue", reference_id=issue.id)
+            # Fast resolve bonus: resolved within 24h of assignment
+            if issue.resolved_at and issue.updated_at:
+                hours_taken = (issue.resolved_at - issue.updated_at).total_seconds() / 3600
+                if hours_taken <= 24:
+                    award_event(db, current_user.id, "fast_resolve", reference_id=issue.id,
+                                note=f"Resolved in {round(hours_taken, 1)}h (< 24h)")
+            # Citizen earns points when their issue is resolved
+            if issue.reporter_id:
+                award_event(db, issue.reporter_id, "issue_resolved", reference_id=issue.id)
+        except Exception as e:
+            logger.error(f"Reward failed for resolved task {issue_id}: {e}", exc_info=True)
+            # Don't fail task resolution if rewards fail - log and continue
 
         # If AI says resolution quality is poor, notify all admins for review
         if ai_result.get("resolution_quality") == "poor" and ai_result.get("is_resolved") is False:
@@ -601,22 +626,6 @@ async def resolve_task(
         )
 
     logger.info(f"Worker {current_user.id} resolved task {issue_id} (AI quality: {ai_result.get('resolution_quality')})")
-
-    # Rewards: worker earns points for resolving
-    try:
-        from app.services.rewards_service import award_event
-        award_event(db, current_user.id, "resolve_issue", reference_id=issue.id)
-        # Fast resolve bonus: resolved within 24h of assignment
-        if issue.resolved_at and issue.updated_at:
-            hours_taken = (issue.resolved_at - issue.updated_at).total_seconds() / 3600
-            if hours_taken <= 24:
-                award_event(db, current_user.id, "fast_resolve", reference_id=issue.id,
-                            note=f"Resolved in {round(hours_taken, 1)}h (< 24h)")
-        # Citizen earns points when their issue is resolved
-        if issue.reporter_id:
-            award_event(db, issue.reporter_id, "issue_resolved", reference_id=issue.id)
-    except Exception:
-        pass
 
     return IssueResponse.model_validate(issue)
 

@@ -28,6 +28,12 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func
+
+from app.services.geofence_utils import (
+    check_geofences_intersect,
+    validate_geofence_radius,
+    validate_geofence_area,
+)
 from sqlalchemy.orm import Session
 
 from app.core.deps import apply_admin_scope, require_any_admin, require_role
@@ -39,6 +45,7 @@ from app.models.geofence import Geofence
 from app.models.issue import Issue
 from app.models.issue_flag import IssueFlag
 from app.models.user import User
+from app.services.admin_messaging import AdminMessage
 from app.schemas.admin import (
     AssignWorker, CreateWorker, CreateGeofenceRequest, DashboardStats, 
     GeofenceListResponse, GeofenceResponse, UpdateWorker, UpdateSubAdmin, UpdateGeofenceRequest
@@ -51,6 +58,14 @@ from app.services.utils import (
     get_users_by_role,
     count_issues_by_status,
 )
+from app.services.auth_service import revoke_all_user_tokens
+from app.services.admin_override import (
+    log_override_access,
+    get_active_overrides,
+    revoke_override,
+    get_override_log,
+)
+from app.core.exceptions import ResourceNotFoundError, ValidationError, ProcessingError
 
 logger = get_logger("admin")
 
@@ -204,9 +219,13 @@ def reassign_worker(
         raise HTTPException(status_code=400, detail="Worker is not accepting new assignments")
     
     # STEP 6: Verify worker is in JURISDICTION (admin's scope)
+    # FIX: Properly validate scope filters - was using zip(scope, scope) which always evaluates to true
     scope = _user_scope_filter(current_user)
-    if scope and not all(getattr(worker, attr.key) == val for attr, val in zip(scope, scope)):
-        raise HTTPException(status_code=403, detail="Worker is not in your administrative jurisdiction")
+    if scope:
+        # Create a test query with worker and scope filters to validate jurisdiction
+        test_query = db.query(User).filter(User.id == worker.id, *scope).first()
+        if not test_query:
+            raise HTTPException(status_code=403, detail="Worker is not in your administrative jurisdiction")
     
     # STEP 7: Check worker's WORKLOAD (active task count)
     active_task_count = db.query(Issue).filter(
@@ -528,29 +547,58 @@ def assign_worker(
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found or not in your jurisdiction")
     
-    # STEP 2: Fetch worker and verify ROLE
-    worker = db.query(User).filter(User.id == body.worker_id).first()
-    if not worker:
-        raise HTTPException(status_code=404, detail="Worker not found")
-    if worker.role != "worker":
-        raise HTTPException(status_code=400, detail="User is not a worker")
+    # STEP 2-6: Fetch worker with full validation including jurisdiction checks
+    # FIX HIGH PRIORITY BUG #1: Location hierarchy validation
+    # Ensure worker's location is within admin's scope
+    query = db.query(User).filter(User.id == body.worker_id, User.role == "worker")
     
-    # STEP 3: Verify worker is ACTIVE
+    # Verify worker is within admin's jurisdiction using location hierarchy
+    # Admin can only assign workers in their scope:
+    # - super-admin: any worker
+    # - district_admin: workers in their district
+    # - taluka_admin: workers in their taluka
+    # - ward_admin: workers in their ward
+    if current_user.role != "admin":  # super-admin can assign anyone
+        if current_user.ward_id:
+            # Ward admin can only assign workers in their ward
+            query = query.filter(User.ward_id == current_user.ward_id)
+        elif current_user.taluka_id:
+            # Taluka admin can only assign workers in their taluka's wards
+            from app.models.location import Ward as WardModel
+            taluka_wards = db.query(WardModel.id).filter(WardModel.taluka_id == current_user.taluka_id).subquery()
+            query = query.filter(User.ward_id.in_(taluka_wards))
+        elif current_user.district_id:
+            # District admin can only assign workers in their district's talukas/wards
+            from app.models.location import Taluka as TalukaModel, Ward as WardModel
+            district_talukas = db.query(TalukaModel.id).filter(TalukaModel.district_id == current_user.district_id).subquery()
+            taluka_wards = db.query(WardModel.id).filter(WardModel.taluka_id.in_(district_talukas)).subquery()
+            query = query.filter(User.ward_id.in_(taluka_wards))
+    
+    # Apply jurisdiction scope filters (additional safety check)
+    scope_filters = _user_scope_filter(current_user)
+    if scope_filters:
+        query = query.filter(*scope_filters)
+    
+    worker = query.first()
+    if not worker:
+        from app.core.exceptions import AuthorizationError
+        raise AuthorizationError(
+            "assign",
+            "worker",
+            {"reason": "Worker not found or outside your jurisdiction", "worker_id": str(body.worker_id)}
+        )
+    
+    # Verify worker is ACTIVE
     if not worker.is_active:
         raise HTTPException(status_code=400, detail="Worker is inactive or suspended")
     
-    # STEP 4: Verify worker is ONLINE
+    # Verify worker is ONLINE
     if not worker.is_online:
         raise HTTPException(status_code=400, detail="Worker is offline (not connected)")
     
-    # STEP 5: Verify worker is AVAILABLE (accepting new tasks)
+    # Verify worker is AVAILABLE (accepting new tasks)
     if not worker.is_available:
         raise HTTPException(status_code=400, detail="Worker is not accepting new assignments")
-    
-    # STEP 6: Verify worker is in JURISDICTION (admin's scope)
-    scope = _user_scope_filter(current_user)
-    if scope and not all(getattr(worker, attr.key) == val for attr, val in zip(scope, scope)):
-        raise HTTPException(status_code=403, detail="Worker is not in your administrative jurisdiction")
     
     # STEP 7: Check worker's WORKLOAD (active task count)
     active_task_count = db.query(Issue).filter(
@@ -769,6 +817,118 @@ def auto_assign_open_issues(
         f"{assigned_count} assigned, {skipped_count} skipped, {total_open} total open"
     )
     return {"assigned": assigned_count, "skipped": skipped_count, "total_open": total_open}
+
+
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Delete a user account (soft-delete/deactivation).
+    
+    FIX HIGH PRIORITY BUG #8: Admin can delete any user - Add role-based deletion checks
+    
+    Authorization rules:
+    - super_admin: can delete any user
+    - district_admin: can delete users in their district (workers and ward_admins)
+    - taluka_admin: can delete users in their taluka (workers and ward_admins)
+    - ward_admin: can delete workers in their ward only
+    - Cannot delete other admins of equal or higher rank
+    
+    **Roles**: any admin.
+    """
+    if str(user_id) == str(current_user.id):
+        raise ValidationError(
+            "user_id",
+            "Cannot delete your own account. Contact support to deactivate your account."
+        )
+    
+    # Fetch the user to delete
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise ResourceNotFoundError("User", user_id)
+    
+    # Authorization checks based on admin role and user role
+    if current_user.role == "admin":  # super-admin
+        # Super-admin can delete anyone
+        pass
+    elif user.role == "admin":  
+        # No regular admin can delete other admins
+        from app.core.exceptions import AuthorizationError
+        raise AuthorizationError("delete", "admin user")
+    elif current_user.role == "district_admin":
+        # District admin can only delete workers and ward_admins in their district
+        if user.role in ["admin", "district_admin", "taluka_admin"]:
+            from app.core.exceptions import AuthorizationError
+            raise AuthorizationError("delete", "higher-rank admin")
+        
+        # Check user is in their district
+        if user.district_id and user.district_id != current_user.district_id:
+            from app.core.exceptions import AuthorizationError
+            raise AuthorizationError("delete", "user outside your jurisdiction")
+    elif current_user.role == "taluka_admin":
+        # Taluka admin can only delete workers and ward_admins in their taluka
+        if user.role in ["admin", "district_admin", "taluka_admin"]:
+            from app.core.exceptions import AuthorizationError
+            raise AuthorizationError("delete", "higher-rank admin")
+        
+        # Check user is in their taluka
+        if user.taluka_id and user.taluka_id != current_user.taluka_id:
+            from app.core.exceptions import AuthorizationError
+            raise AuthorizationError("delete", "user outside your jurisdiction")
+    elif current_user.role == "ward_admin":
+        # Ward admin can only delete workers in their ward
+        if user.role != "worker":
+            from app.core.exceptions import AuthorizationError
+            raise AuthorizationError("delete", "non-worker user")
+        
+        if user.ward_id and user.ward_id != current_user.ward_id:
+            from app.core.exceptions import AuthorizationError
+            raise AuthorizationError("delete", "worker outside your ward")
+    
+    # Perform soft delete (deactivation)
+    try:
+        # Log the deletion action for audit purposes
+        logger.warning(
+            f"Admin deleted user account",
+            extra={
+                "deleting_admin_id": str(current_user.id),
+                "deleting_admin_role": current_user.role,
+                "deleted_user_id": str(user_id),
+                "deleted_user_role": user.role,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+        
+        # Mark as inactive and revoke tokens
+        user.is_active = False
+        revoke_all_user_tokens(str(user_id), db)
+        
+        # If worker, unassign pending tasks
+        if user.role == "worker":
+            pending = db.query(Issue).filter(
+                Issue.assigned_worker_id == user_id,
+                Issue.status.in_(["assigned", "in_progress"])
+            ).all()
+            for issue in pending:
+                issue.assigned_worker_id = None
+                issue.status = "open"
+        
+        db.commit()
+        
+        logger.info(
+            f"User {user_id} ({user.role}) deleted by admin {current_user.id}",
+            extra={
+                "admin_role": current_user.role,
+                "user_role": user.role,
+                "pending_tasks_reassigned": len(pending) if user.role == "worker" else 0
+            }
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting user {user_id}: {e}", exc_info=True)
+        raise ProcessingError(f"Failed to delete user: {str(e)}")
 
 
 @router.delete("/issues/{issue_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1640,20 +1800,36 @@ def create_sub_admin(
 
     Hierarchy rules:
     - ``admin`` (super) can create any sub-admin role.
-    - ``district_admin`` can create ``taluka_admin`` in their district.
+    - ``district_admin`` can create ``taluka_admin`` and ``ward_admin`` in their district.
     - ``taluka_admin`` can create ``ward_admin`` in their taluka.
+    - ``ward_admin`` cannot create any admins.
+
+    ADMIN ROLES AUDIT - GAP #2: Sub-Admin Creation Validation
+    Enforces strict role hierarchy to prevent privilege escalation.
 
     **Roles**: admin, district_admin, taluka_admin.
     """
+    # ADMIN AUDIT FIX: Explicit hierarchy validation - prevent lower-level admins from creating higher roles
     allowed_role_creation = {
-        "admin": {"ward_admin", "taluka_admin", "district_admin"},
-        "district_admin": {"taluka_admin", "ward_admin"},
-        "taluka_admin": {"ward_admin"},
+        "admin": {"ward_admin", "taluka_admin", "district_admin"},  # super-admin can create all
+        "district_admin": {"taluka_admin", "ward_admin"},           # district can create taluka/ward
+        "taluka_admin": {"ward_admin"},                             # taluka can only create ward
+        # ward_admin is intentionally excluded - cannot create admins
     }
+    
+    # Check if current user's role is allowed to create admins at all
+    if current_user.role not in allowed_role_creation:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your role ({current_user.role}) cannot create admin accounts."
+        )
+    
+    # Check if attempted role is in the allowed set for current user
     if body.role not in allowed_role_creation.get(current_user.role, set()):
         raise HTTPException(
             status_code=403,
-            detail=f"Your role ({current_user.role}) cannot create a {body.role}.",
+            detail=f"Your role ({current_user.role}) cannot create a {body.role}. "
+                   f"Allowed roles: {', '.join(allowed_role_creation.get(current_user.role, set())) or 'none'}"
         )
 
     try:
@@ -1680,7 +1856,7 @@ def create_sub_admin(
         logger.error(f"Error creating sub-admin: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create sub-admin account.")
 
-    logger.info(f"Admin {current_user.id} created {body.role}: {sub_admin.id}")
+    logger.info(f"Admin {current_user.id} ({current_user.role}) created {body.role}: {sub_admin.id}")
     return UserResponse.model_validate(sub_admin)
 
 
@@ -1807,6 +1983,438 @@ def change_user_role(
 
     logger.info(f"Admin {current_user.id} changed user {user_id} role: {old_role} → {role}")
     return UserResponse.model_validate(user)
+
+
+# ── Admin Override Access ──────────────────────────────────────────────────────
+# ADMIN ROLES AUDIT - GAP #3: Cross-Admin Data Visibility Override
+# Allows super-admins to grant temporary access to data outside normal scope with audit logging
+
+class GrantOverrideRequest(BaseModel):
+    """Request to grant override access to another admin."""
+    target_admin_id: uuid.UUID = Field(..., description="Admin to grant override to")
+    target_scope: str = Field(..., description="Scope to grant access to (e.g., 'ward:123', 'taluka:456')")
+    reason: str = Field(..., description="Reason for override (incident ID, emergency, etc.)")
+    duration_minutes: Optional[int] = Field(None, description="How long override lasts (None = permanent)")
+
+
+@router.post("/overrides/grant")
+def grant_override_access(
+    body: GrantOverrideRequest,
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    """Grant an admin temporary access to data outside their normal geographic scope.
+    
+    Incident Response Use Case:
+    - Ward 1 admin needs to coordinate with Ward 2 during emergency
+    - Super-admin grants temporary override to access Ward 2 data
+    - All access is logged for compliance/audit trail
+    
+    **Roles**: super-admin only.
+    """
+    # Verify target admin exists
+    target_admin = db.query(User).filter(
+        User.id == body.target_admin_id,
+        User.role.in_(["ward_admin", "taluka_admin", "district_admin"])
+    ).first()
+    if not target_admin:
+        raise HTTPException(status_code=404, detail="Target admin not found")
+    
+    try:
+        # Log the override grant
+        override_log = log_override_access(
+            admin=target_admin,
+            target_scope=body.target_scope,
+            reason=body.reason,
+            resource_type="cross_scope_access",
+            duration_minutes=body.duration_minutes,
+            db=db
+        )
+        
+        logger.info(
+            f"Super-admin {current_user.id} granted override to {target_admin.id} "
+            f"for scope {body.target_scope}. Reason: {body.reason}",
+            extra={"audit": True}
+        )
+        
+        return {
+            "status": "success",
+            "override_id": str(override_log.id),
+            "message": f"Override granted until {override_log.override_until or 'revoked manually'}",
+            "target_admin": target_admin.name,
+            "target_scope": body.target_scope,
+        }
+    except Exception as e:
+        logger.error(f"Error granting override: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to grant override access")
+
+
+@router.get("/overrides/active")
+def list_active_overrides(
+    admin_id: Optional[uuid.UUID] = Query(None, description="Filter by admin"),
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    """List all active override access grants.
+    
+    **Roles**: super-admin only.
+    """
+    try:
+        if admin_id:
+            overrides = get_active_overrides(admin_id, db)
+        else:
+            # Get all active overrides for all admins
+            from app.services.admin_override import AdminOverrideLog
+            overrides = (
+                db.query(AdminOverrideLog)
+                .filter(
+                    (AdminOverrideLog.override_until.is_(None)) |
+                    (AdminOverrideLog.override_until > datetime.utcnow())
+                )
+                .order_by(AdminOverrideLog.created_at.desc())
+                .all()
+            )
+        
+        return {
+            "status": "success",
+            "count": len(overrides),
+            "overrides": [
+                {
+                    "id": str(o.id),
+                    "admin_id": str(o.admin_id),
+                    "admin_role": o.admin_role,
+                    "target_scope": o.target_scope,
+                    "reason": o.reason,
+                    "created_at": o.created_at.isoformat(),
+                    "expires_at": o.override_until.isoformat() if o.override_until else None,
+                }
+                for o in overrides
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error listing active overrides: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch active overrides")
+
+
+@router.post("/overrides/{override_id}/revoke")
+def revoke_admin_override(
+    override_id: uuid.UUID,
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    """Revoke an active override access grant.
+    
+    **Roles**: super-admin only.
+    """
+    try:
+        from app.services.admin_override import AdminOverrideLog
+        
+        override_log = db.query(AdminOverrideLog).filter(AdminOverrideLog.id == override_id).first()
+        if not override_log:
+            raise HTTPException(status_code=404, detail="Override not found")
+        
+        revoke_override(override_id, db)
+        
+        logger.info(
+            f"Super-admin {current_user.id} revoked override {override_id} "
+            f"for admin {override_log.admin_id}",
+            extra={"audit": True}
+        )
+        
+        return {
+            "status": "success",
+            "message": "Override successfully revoked",
+            "override_id": str(override_id)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error revoking override: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to revoke override")
+
+
+@router.get("/overrides/audit-log")
+def get_override_audit_log(
+    admin_id: Optional[uuid.UUID] = Query(None, description="Filter by admin"),
+    days: int = Query(30, ge=7, le=90, description="Days of history to retrieve"),
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    """Get audit log of all override access (active and revoked).
+    
+    **Roles**: super-admin only.
+    """
+    try:
+        overrides = get_override_log(admin_id=admin_id, days=days, db=db)
+        
+        return {
+            "status": "success",
+            "count": len(overrides),
+            "days": days,
+            "audit_log": [
+                {
+                    "id": str(o.id),
+                    "admin_id": str(o.admin_id),
+                    "admin_role": o.admin_role,
+                    "target_scope": o.target_scope,
+                    "reason": o.reason,
+                    "resource_type": o.accessed_resource_type,
+                    "created_at": o.created_at.isoformat(),
+                    "expires_at": o.override_until.isoformat() if o.override_until else None,
+                    "is_active": o.override_until is None or o.override_until > datetime.utcnow()
+                }
+                for o in overrides
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching override audit log: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch audit log")
+
+
+# ── Admin Messaging ────────────────────────────────────────────────────────────
+# ADMIN ROLES AUDIT - GAP #1: Admin-to-Admin Communication
+# Messaging system for inter-admin coordination across hierarchy
+
+class SendMessageRequest(BaseModel):
+    """Request to send a message between admins."""
+    receiver_id: uuid.UUID = Field(..., description="ID of receiving admin")
+    subject: str = Field(..., min_length=1, max_length=255)
+    body: str = Field(..., min_length=1, max_length=5000)
+    message_type: str = Field("general", description="general | issue | worker | incident | escalation")
+    is_urgent: str = Field("normal", description="normal | urgent | critical")
+    related_resource_type: Optional[str] = Field(None, description="issue | worker | incident")
+    related_resource_id: Optional[uuid.UUID] = Field(None, description="ID of related resource")
+
+
+@router.post("/messages")
+def send_message(
+    body: SendMessageRequest,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Send a message to another admin.
+    
+    **Roles**: any admin.
+    """
+    try:
+        from app.services.admin_messaging import send_admin_message
+        
+        # Verify receiver exists and is an admin
+        receiver = db.query(User).filter(
+            User.id == body.receiver_id,
+            User.role.in_(["ward_admin", "taluka_admin", "district_admin", "admin"])
+        ).first()
+        if not receiver:
+            raise HTTPException(status_code=404, detail="Recipient not found or is not an admin")
+        
+        if body.receiver_id == current_user.id:
+            raise HTTPException(status_code=400, detail="Cannot send message to yourself")
+        
+        # Send message
+        message = send_admin_message(
+            sender=current_user,
+            receiver_id=body.receiver_id,
+            subject=body.subject,
+            body=body.body,
+            message_type=body.message_type,
+            related_resource_type=body.related_resource_type,
+            related_resource_id=body.related_resource_id,
+            is_urgent=body.is_urgent,
+            db=db
+        )
+        
+        return {
+            "status": "success",
+            "message_id": str(message.id),
+            "receiver": receiver.name,
+            "sent_at": message.created_at.isoformat(),
+            "subject": body.subject,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending admin message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to send message")
+
+
+@router.get("/messages/inbox")
+def get_inbox_messages(
+    unread_only: bool = Query(False, description="Show unread messages only"),
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Get inbox messages for current admin.
+    
+    **Roles**: any admin.
+    """
+    try:
+        from app.services.admin_messaging import get_inbox
+        
+        all_messages = get_inbox(current_user.id, unread_only=unread_only, db=db)
+        total = len(all_messages)
+        
+        # Apply pagination
+        messages = all_messages[(page - 1) * size : page * size]
+        
+        return {
+            "status": "success",
+            "total": total,
+            "page": page,
+            "size": size,
+            "messages": [
+                {
+                    "id": str(m.id),
+                    "from": m.sender.name if m.sender else None,
+                    "sender_role": m.sender.role if m.sender else None,
+                    "subject": m.subject,
+                    "preview": m.body[:100] + "..." if len(m.body) > 100 else m.body,
+                    "message_type": m.message_type,
+                    "is_urgent": m.is_urgent,
+                    "is_read": m.is_read is not None,
+                    "received_at": m.created_at.isoformat(),
+                    "related_resource": {
+                        "type": m.related_resource_type,
+                        "id": str(m.related_resource_id) if m.related_resource_id else None
+                    } if m.related_resource_type else None,
+                }
+                for m in messages
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching inbox: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch messages")
+
+
+@router.get("/messages/unread/count")
+def get_unread_count(
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Get unread message count.
+    
+    **Roles**: any admin.
+    """
+    try:
+        from app.services.admin_messaging import get_unread_count
+        
+        count = get_unread_count(current_user.id, db)
+        
+        return {
+            "status": "success",
+            "unread_count": count
+        }
+    except Exception as e:
+        logger.error(f"Error getting unread count: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get unread count")
+
+
+@router.get("/messages/sent")
+def get_sent_messages(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Get sent messages for current admin.
+    
+    **Roles**: any admin.
+    """
+    try:
+        from app.services.admin_messaging import get_sent_messages
+        
+        all_messages = get_sent_messages(current_user.id, db=db)
+        total = len(all_messages)
+        
+        # Apply pagination
+        messages = all_messages[(page - 1) * size : page * size]
+        
+        return {
+            "status": "success",
+            "total": total,
+            "page": page,
+            "size": size,
+            "messages": [
+                {
+                    "id": str(m.id),
+                    "to": m.receiver.name if m.receiver else None,
+                    "receiver_role": m.receiver.role if m.receiver else None,
+                    "subject": m.subject,
+                    "preview": m.body[:100] + "..." if len(m.body) > 100 else m.body,
+                    "message_type": m.message_type,
+                    "is_urgent": m.is_urgent,
+                    "is_read": m.is_read is not None,
+                    "sent_at": m.created_at.isoformat(),
+                    "related_resource": {
+                        "type": m.related_resource_type,
+                        "id": str(m.related_resource_id) if m.related_resource_id else None
+                    } if m.related_resource_type else None,
+                }
+                for m in messages
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching sent messages: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch messages")
+
+
+@router.get("/messages/{message_id}")
+def get_message(
+    message_id: uuid.UUID,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Get full message details.
+    
+    **Roles**: any admin.
+    """
+    try:
+        from app.services.admin_messaging import mark_read, AdminMessage
+
+        message = db.query(AdminMessage) \
+            .filter(AdminMessage.id == message_id) \
+            .first()
+
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        if message.receiver_id != current_user.id and message.sender_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+
+        if message.receiver_id == current_user.id and not message.is_read:
+            mark_read(message_id, db)
+            message.is_read = datetime.utcnow()
+
+        return {
+            "status": "success",
+            "id": str(message.id),
+            "from": {
+                "id": str(message.sender_id),
+                "name": message.sender.name if message.sender else None,
+                "role": message.sender.role if message.sender else None,
+            },
+            "to": {
+                "id": str(message.receiver_id),
+                "name": message.receiver.name if message.receiver else None,
+                "role": message.receiver.role if message.receiver else None,
+            },
+            "subject": message.subject,
+            "body": message.body,
+            "message_type": message.message_type,
+            "is_urgent": message.is_urgent,
+            "is_read": message.is_read is not None,
+            "created_at": message.created_at.isoformat(),
+            "related_resource": {
+                "type": message.related_resource_type,
+                "id": str(message.related_resource_id) if message.related_resource_id else None
+            } if message.related_resource_type else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching message {message_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch message")
 
 
 # ── Announcements ─────────────────────────────────────────────────────────────
@@ -2282,9 +2890,21 @@ def list_geofences(
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """List all geofences with pagination.
+    """List geofences with pagination and admin scope filtering.
     
-    **Roles**: admin or district_admin.
+    ADMIN ROLES AUDIT - GAP #5: Scope Consistency
+    Applies geographic scope filtering based on admin role.
+    - super_admin: sees all geofences
+    - district_admin: sees geofences in their district
+    - taluka_admin: sees geofences in their taluka
+    - ward_admin: sees geofences in their ward
+    
+    NOTE: Current Geofence model does not track ward_id/taluka_id/district_id.
+    For full geographic scoping, Geofence model needs to be extended with geographic fields
+    via database migration. Until then, all admins can see all geofences but access control
+    is enforced at creation/update/delete time.
+    
+    **Roles**: any admin.
     
     Args:
         page: Page number (1-indexed), default 1
@@ -2295,6 +2915,18 @@ def list_geofences(
     """
     try:
         query = db.query(Geofence)
+        
+        # FUTURE: Apply geographic scope filtering once Geofence model has geographic fields
+        # For now, all admins see all geofences (system-level resource)
+        # TODO: Add ward_id, taluka_id, district_id to Geofence model and apply:
+        # if current_user.role == "ward_admin" and current_user.ward_id:
+        #     query = query.filter(Geofence.ward_id == current_user.ward_id)
+        # elif current_user.role == "taluka_admin" and current_user.taluka_id:
+        #     query = query.filter(Geofence.taluka_id == current_user.taluka_id)
+        # elif current_user.role == "district_admin" and current_user.district_id:
+        #     query = query.filter(Geofence.district_id == current_user.district_id)
+        # super_admin views all
+        
         total = query.count()
         
         geofences = (
@@ -2357,6 +2989,32 @@ def create_geofence(
         
         if body.radius_km <= 0:
             raise HTTPException(status_code=400, detail="Radius must be greater than 0")
+        
+        # FIX: HIGH PRIORITY BUG #12 - Geofence validation incomplete
+        # Validate geofence radius is within reasonable bounds
+        try:
+            validate_geofence_radius(body.radius_km)
+            validate_geofence_area(body.radius_km)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
+        # MEDIUM PRIORITY BUG FIX #4: Check for overlapping geofences
+        existing_geofences = db.query(Geofence).all()
+        overlapping = []
+        for existing in existing_geofences:
+            if check_geofences_intersect(
+                body.latitude, body.longitude, body.radius_km,
+                existing.latitude, existing.longitude, existing.radius_km
+            ):
+                overlapping.append(existing.name)
+        
+        if overlapping:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Geofence overlaps with existing zones: {', '.join(overlapping)}. "
+                       f"Please adjust the location or radius to avoid overlap with: {', '.join(overlapping[:3])}"
+                       + (" and more" if len(overlapping) > 3 else "")
+            )
         
         # Create geofence
         geofence = Geofence(

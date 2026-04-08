@@ -99,33 +99,60 @@ class DashboardStats(BaseModel):
 # ── Geofence Schemas ──────────────────────────────────────────────────────────
 
 class CreateGeofenceRequest(BaseModel):
-    """Request body for ``POST /admin/geofences``."""
+    """Request body for ``POST /admin/geofences``.
+    
+    FIX HIGH PRIORITY BUG #12 & MEDIUM PRIORITY BUG #4: Comprehensive geofence validation
+    - Validates coordinate ranges
+    - Enforces radius limits (0.1 km to 100 km)
+    - Prevents invalid/unsafe geofences
+    """
 
     name: str = Field(..., min_length=1, max_length=255, description="Zone name")
     latitude: float = Field(..., ge=-90, le=90, description="Latitude (-90 to 90)")
     longitude: float = Field(..., ge=-180, le=180, description="Longitude (-180 to 180)")
-    radius_km: float = Field(..., gt=0, description="Radius in kilometers (must be > 0)")
+    radius_km: float = Field(..., gt=0, le=100, description="Radius in km (0.1 km to 100 km, typically)")
 
     @validator('name')
     def name_not_blank(cls, v):
         if not v or not v.strip():
             raise ValueError('name cannot be empty or whitespace')
         return v.strip()
+    
+    @validator('radius_km')
+    def radius_valid(cls, v):
+        # Enforce practical limits (100m minimum, 100km maximum)
+        if v < 0.1:
+            raise ValueError('radius_km must be at least 0.1 km (100 meters)')
+        if v > 100:
+            raise ValueError('radius_km must not exceed 100 km')
+        return v
 
 
 class UpdateGeofenceRequest(BaseModel):
-    """Request body for ``PATCH /admin/geofences/{id}`` (all fields optional)."""
+    """Request body for ``PATCH /admin/geofences/{id}`` (all fields optional).
+    
+    FIX HIGH PRIORITY BUG #12: Geofence validation with radius limits
+    """
 
     name: Optional[str] = Field(None, min_length=1, max_length=255, description="Zone name")
     latitude: Optional[float] = Field(None, ge=-90, le=90, description="Latitude (-90 to 90)")
     longitude: Optional[float] = Field(None, ge=-180, le=180, description="Longitude (-180 to 180)")
-    radius_km: Optional[float] = Field(None, gt=0, description="Radius in kilometers (must be > 0)")
+    radius_km: Optional[float] = Field(None, gt=0, le=100, description="Radius in km (0.1 to 100)")
 
     @validator('name')
     def name_not_blank(cls, v):
         if v is not None and (not v or not v.strip()):
             raise ValueError('name cannot be empty or whitespace')
         return v.strip() if v else None
+    
+    @validator('radius_km')
+    def radius_valid(cls, v):
+        if v is not None:
+            if v < 0.1:
+                raise ValueError('radius_km must be at least 0.1 km (100 meters)')
+            if v > 100:
+                raise ValueError('radius_km must not exceed 100 km')
+        return v
 
 
 class GeofenceResponse(BaseModel):

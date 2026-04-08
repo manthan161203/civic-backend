@@ -12,16 +12,67 @@ Frontend Integration Notes:
 """
 
 from datetime import datetime
+from enum import Enum
 from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
+from app.core.sanitize import sanitize_comment, sanitize_description
+
+
+# MEDIUM PRIORITY BUG FIX #1: Explicit Enum Validation
+class IssueTypeEnum(str, Enum):
+    """Valid built-in issue types in the system"""
+    garbage = "garbage"
+    pothole = "pothole"
+    streetlight = "streetlight"
+    drain = "drain"
+    water = "water"
+    other = "other"
+
+
+class IssueSeverityEnum(str, Enum):
+    """Issue severity levels"""
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
+class IssuePriorityEnum(str, Enum):
+    """Issue priority levels"""
+    low = "low"
+    medium = "medium"
+    high = "high"
+    urgent = "urgent"
+
+
+class IssueStatusEnum(str, Enum):
+    """Issue status lifecycle"""
+    open = "open"
+    assigned = "assigned"
+    in_progress = "in_progress"
+    resolved = "resolved"
+    closed = "closed"
+
+
+class DepartmentEnum(str, Enum):
+    """Government departments"""
+    water = "water"
+    roads = "roads"
+    electricity = "electricity"
+    sanitation = "sanitation"
+    parks = "parks"
+    other = "other"
 
 
 class IssueCreate(BaseModel):
-    """Request body for ``POST /issues``."""
+    """Request body for ``POST /issues``.
+    
+    FIX MEDIUM PRIORITY BUG #1: Missing enum validation on issue_type/severity/priority
+    All enums are now strictly validated with explicit Enum types.
+    """
 
-    issue_type: str = Field(..., description="garbage | pothole | streetlight | drain | water | other")
+    issue_type: IssueTypeEnum = Field(..., description="garbage | pothole | streetlight | drain | water | other")
     custom_issue_type_label: Optional[str] = Field(None, max_length=100, description="Custom label when issue_type is 'other'")
     description: Optional[str] = Field(None, max_length=5000, description="Free-text description of the issue")
     latitude: float = Field(..., ge=-90, le=90, description="GPS latitude of the issue location")
@@ -29,37 +80,19 @@ class IssueCreate(BaseModel):
     address: Optional[str] = Field(None, max_length=500, description="Human-readable address for display")
     ward: Optional[str] = Field(None, max_length=200, description="Ward name/number (falls back to reporter's ward)")
     ward_id: Optional[UUID] = Field(None, description="Structured ward UUID (from /locations/talukas/{id}/wards)")
-    severity: Optional[str] = Field("medium", description="high | medium | low")
-    priority: Optional[str] = Field("medium", description="urgent | high | medium | low")
-    department: Optional[str] = Field(None, description="water | roads | electricity | sanitation | parks | other")
+    severity: Optional[IssueSeverityEnum] = Field(IssueSeverityEnum.medium, description="high | medium | low")
+    priority: Optional[IssuePriorityEnum] = Field(IssuePriorityEnum.medium, description="urgent | high | medium | low")
+    department: Optional[DepartmentEnum] = Field(None, description="water | roads | electricity | sanitation | parks | other")
     is_sos: bool = Field(False, description="Emergency SOS flag — immediately broadcasts to nearby citizens within 500m")
 
-    @field_validator("issue_type")
+    @field_validator("description")
     @classmethod
-    def validate_issue_type(cls, v: str) -> str:
-        # Built-in types (always valid)
-        built_in = ("garbage", "pothole", "streetlight", "drain", "water", "other")
-        if v in built_in:
-            return v
-        # Custom type slugs are validated in the route handler against approved types
-        if isinstance(v, str) and len(v) > 0 and len(v) <= 100:
-            return v
-        raise ValueError("issue_type must be a built-in type or an approved custom type slug")
-
-
-    @field_validator("severity")
-    @classmethod
-    def validate_severity(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and v not in ("high", "medium", "low"):
-            raise ValueError("severity must be one of: high, medium, low")
-        return v
-
-    @field_validator("priority")
-    @classmethod
-    def validate_priority(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and v not in ("urgent", "high", "medium", "low"):
-            raise ValueError("priority must be one of: urgent, high, medium, low")
-        return v
+    def sanitize_desc(cls, v: Optional[str]) -> Optional[str]:
+        """Sanitize description to prevent XSS attacks"""
+        if v is None:
+            return None
+        sanitized = sanitize_description(v)
+        return sanitized
 
 
 class IssueUpdate(BaseModel):
@@ -77,20 +110,12 @@ class IssueUpdate(BaseModel):
         citizen_rating:     Satisfaction rating 1-5 (citizen only, on resolved issues).
     """
 
-    status: Optional[str] = Field(None, description="open | assigned | in_progress | resolved | closed")
+    status: Optional[IssueStatusEnum] = Field(None, description="open | assigned | in_progress | resolved | closed")
     resolution_notes: Optional[str] = Field(None, max_length=5000, description="Worker's notes about the resolution")
     assigned_worker_id: Optional[UUID] = Field(None, description="Worker UUID to assign (admin only)")
     citizen_rating: Optional[int] = Field(None, ge=1, le=5, description="Satisfaction rating 1-5 (citizen only)")
-    priority: Optional[str] = Field(None, description="urgent | high | medium | low (admin only)")
-    department: Optional[str] = Field(None, description="water | roads | electricity | sanitation | parks | other")
-
-    @field_validator("status")
-    @classmethod
-    def validate_status(cls, v: Optional[str]) -> Optional[str]:
-        allowed = ("open", "assigned", "in_progress", "resolved", "closed")
-        if v is not None and v not in allowed:
-            raise ValueError(f"status must be one of: {', '.join(allowed)}")
-        return v
+    priority: Optional[IssuePriorityEnum] = Field(None, description="urgent | high | medium | low (admin only)")
+    department: Optional[DepartmentEnum] = Field(None, description="water | roads | electricity | sanitation | parks | other")
 
     @field_validator("citizen_rating")
     @classmethod
@@ -119,14 +144,26 @@ class IssueReporterInfo(BaseModel):
 class IssueCommentCreate(BaseModel):
     """Request body for ``POST /issues/{id}/comments``.
 
+    MEDIUM PRIORITY BUG FIX #7: HTML Sanitization - Prevents XSS attacks on comments
+
     Attributes:
-        body:      Comment text content.
+        body:      Comment text content - automatically sanitized to remove XSS vectors
         parent_id: UUID of the parent comment when replying (optional).
+        is_internal: Internal note — visible to workers and admins only
     """
 
-    body: str = Field(..., min_length=1, description="Comment text content")
+    body: str = Field(..., min_length=1, max_length=5000, description="Comment text content")
     parent_id: Optional[UUID] = Field(None, description="Parent comment UUID for replies")
     is_internal: bool = Field(False, description="Internal note — visible to workers and admins only")
+    
+    @field_validator("body")
+    @classmethod
+    def sanitize_body(cls, v: str) -> str:
+        """Sanitize comment body to prevent XSS attacks"""
+        sanitized = sanitize_comment(v)
+        if not sanitized:
+            raise ValueError("Comment body cannot be empty after sanitization")
+        return sanitized
 
 
 class IssueCommentAuthor(BaseModel):

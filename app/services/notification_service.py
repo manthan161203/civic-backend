@@ -20,6 +20,7 @@ Usage:
 """
 
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -198,6 +199,9 @@ def notify(
 ) -> Notification:
     """Save a notification to DB and optionally fire an FCM push.
 
+    FIX HIGH PRIORITY BUG #11: Notification broadcasting race condition
+    Added idempotency check to prevent duplicate notifications for assignment broadcasts.
+    
     The DB record is always created. FCM push is only attempted if ``fcm_token``
     is provided. FCM failure is logged but does not raise or block the DB write.
 
@@ -216,6 +220,22 @@ def notify(
     Returns:
         The saved ``Notification`` ORM object.
     """
+    # Check for duplicate assignment notifications (race condition prevention)
+    # Only check for assignment notifications to avoid false duplicates
+    if notification_type == "assignment" and issue_id:
+        existing = db.query(Notification).filter(
+            Notification.user_id == user_id,
+            Notification.issue_id == issue_id,
+            Notification.type == "assignment",
+            Notification.created_at >= (datetime.utcnow() - timedelta(seconds=5))  # Within 5 seconds
+        ).first()
+        if existing:
+            logger.info(
+                f"Duplicate notification prevented (idempotency)",
+                extra={"user_id": user_id, "issue_id": issue_id, "type": notification_type}
+            )
+            return existing
+    
     notif = Notification(
         id=uuid.uuid4(),
         user_id=user_id,

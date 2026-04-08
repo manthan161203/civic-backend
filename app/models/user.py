@@ -90,3 +90,5 @@ class User(Base):
     reported_issues = relationship("Issue", foreign_keys="Issue.reporter_id", back_populates="reporter")
     assigned_issues = relationship("Issue", foreign_keys="Issue.assigned_worker_id", back_populates="assigned_worker")
     notifications = relationship("Notification", back_populates="user")
+    messages_sent = relationship("AdminMessage", foreign_keys="AdminMessage.sender_id", back_populates="sender")
+    messages_received = relationship("AdminMessage", foreign_keys="AdminMessage.receiver_id", back_populates="receiver")

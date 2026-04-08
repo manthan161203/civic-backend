@@ -597,10 +597,42 @@ def list_public_announcements(
     Returns announcements matching the provided location parameters
     plus all state-wide (scope=state) announcements.
     Expired announcements are excluded automatically.
+    
+    FIX: HIGH PRIORITY BUG #7 - Missing jurisdiction checks
+    Citizens can only see announcements for their own ward or subscribed wards.
 
     **Roles**: any authenticated user.
     """
     try:
+        # FIX: Validate citizen jurisdiction - prevent cross-ward access
+        if current_user.role == "citizen" and (ward_id or taluka_id or district_id):
+            # Citizens can only see announcements for their own ward
+            citizen_ward_id = current_user.ward_id
+            
+            if ward_id and ward_id != citizen_ward_id:
+                # Check if citizen is subscribed to this ward
+                is_subscribed = db.query(WardSubscription).filter(
+                    WardSubscription.citizen_id == current_user.id,
+                    WardSubscription.ward_id == ward_id
+                ).first()
+                if not is_subscribed:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You can only view announcements for your own ward or subscribed wards"
+                    )
+            
+            # Citizens cannot access taluka or district level announcements
+            if taluka_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Citizens can only view ward-level announcements"
+                )
+            if district_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Citizens can only view ward-level announcements"
+                )
+        
         now = datetime.utcnow()
         base = db.query(Announcement).filter(
             (Announcement.expires_at.is_(None)) | (Announcement.expires_at > now)

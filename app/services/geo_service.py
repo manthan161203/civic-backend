@@ -158,6 +158,9 @@ def auto_assign(issue, db: Session) -> bool:
     Respects issue department for routing.
     Updates ``issue.assigned_worker_id`` and ``issue.status`` in-place.
     The caller must call ``db.commit()`` to persist changes.
+    
+    FIX: HIGH PRIORITY BUG #5 - No worker found case
+    Now notifies admins when no worker is available for manual assignment.
 
     Args:
         issue: Issue ORM object to assign.
@@ -174,7 +177,47 @@ def auto_assign(issue, db: Session) -> bool:
         department=getattr(issue, "department", None),
     )
     if not worker:
-        logger.warning(f"No available worker for issue {issue.id} (ward='{issue.ward}', dept='{getattr(issue, 'department', None)}')")
+        logger.warning(
+            f"No available worker for issue {issue.id}",
+            extra={
+                "issue_id": str(issue.id),
+                "ward": issue.ward,
+                "department": getattr(issue, 'department', None),
+                "type": issue.issue_type,
+            }
+        )
+        
+        # Notify admins for manual assignment
+        try:
+            from app.services.notification_service import notify_localized
+            from app.models.user import User as UserModel
+            
+            admins = db.query(UserModel).filter(
+                UserModel.role == "admin",
+                UserModel.is_active == True
+            ).all()
+            
+            for admin in admins:
+                notify_localized(
+                    db=db,
+                    user=admin,
+                    key="manual_assignment_required",
+                    notification_type="alert",
+                    issue_id=str(issue.id),
+                    issue_id_short=str(issue.id)[:8],
+                    issue_type=issue.issue_type,
+                    ward=issue.ward or "unknown",
+                    department=getattr(issue, 'department', None) or "none",
+                )
+            
+            if admins:
+                logger.info(
+                    f"Notified {len(admins)} admin(s) for manual assignment of issue {issue.id}",
+                    extra={"issue_id": str(issue.id), "admin_count": len(admins)}
+                )
+        except Exception as e:
+            logger.error(f"Failed to notify admins of manual assignment need: {e}", exc_info=True)
+        
         return False
 
     issue.assigned_worker_id = worker.id

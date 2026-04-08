@@ -11,12 +11,15 @@ Frontend Integration Notes:
 """
 
 import uuid
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+import bleach  # FIX MEDIUM PRIORITY BUG #7: HTML sanitization
 
 from app.core.deps import get_current_user, require_role
 from app.core.logger import get_logger
@@ -79,6 +82,46 @@ def _populate_comment_counts(db: Session, responses: List[IssueResponse]) -> Non
         resp.comment_count = comment_counts.get(resp.id, 0)
 
 
+def _validate_status_transition(current_status: str, new_status: str, user_role: str) -> None:
+    """Validate that a status transition is allowed for the given role.
+    
+    Valid transitions:
+    - Admin: open → assigned, assigned → in_progress, in_progress → resolved, resolved → closed
+    - Worker: assigned → in_progress, in_progress → resolved
+    - Citizen: resolved → closed, open → open (reopen) [when is_admin=true in body]
+    - Anyone: * → open (reopen if issue was resolved/closed)
+    
+    FIX: HIGH PRIORITY BUG #3 - Status transition validation missing
+    """
+    valid_transitions = {
+        ("open", "assigned"): {"admin"},
+        ("open", "in_progress"): {"admin"},
+        ("assigned", "in_progress"): {"worker", "admin"},
+        ("in_progress", "resolved"): {"worker", "admin"},
+        ("resolved", "closed"): {"citizen", "admin"},
+        ("resolved", "open"): {"admin"},  # Reopen
+        ("closed", "open"): {"admin"},  # Reopen
+        ("open", "open"): {"citizen", "worker", "admin"},  # No-op
+    }
+    
+    transition = (current_status, new_status)
+    if transition not in valid_transitions:
+        raise ValidationError(
+            "invalid_status_transition",
+            f"Cannot transition from '{current_status}' to '{new_status}' for role '{user_role}'. "
+            f"Valid next states from '{current_status}': "
+            f"{', '.join(dst for (src, dst) in valid_transitions.keys() if src == current_status)}"
+        )
+    
+    if user_role not in valid_transitions[transition]:
+        allowed_roles = valid_transitions[transition]
+        raise ValidationError(
+            "unauthorized_status_transition",
+            f"Role '{user_role}' cannot transition to '{new_status}'. "
+            f"Allowed roles: {', '.join(sorted(allowed_roles))}"
+        )
+
+
 @router.post("", response_model=IssueResponse, status_code=status.HTTP_201_CREATED)
 async def create_issue(
     body: IssueCreate,
@@ -130,6 +173,18 @@ async def create_issue(
                     f"Daily limit reached. You can report at most {DAILY_ISSUE_LIMIT_CITIZEN} "
                     f"issues per day. Please try again tomorrow."
                 )
+
+        # ──── GPS BOUNDS VALIDATION ────────────────────────────────────────────
+        if not (-90 <= body.latitude <= 90):
+            raise ValidationError(
+                "latitude",
+                "Latitude must be between -90 and 90"
+            )
+        if not (-180 <= body.longitude <= 180):
+            raise ValidationError(
+                "longitude",
+                "Longitude must be between -180 and 180"
+            )
 
         # ──── WARD RESOLUTION ────────────────────────────────────────────────
         resolved_ward = body.ward or current_user.ward
@@ -328,7 +383,9 @@ async def create_issue(
                 )
 
         # ──── SOS BROADCAST ─────────────────────────────────────────────────
-        if body.is_sos:
+        # FIX HIGH PRIORITY BUG #2: SOS broadcast duplicate prevention
+        # Check sos_radius_notified flag to prevent duplicate broadcasts
+        if body.is_sos and not issue.sos_radius_notified:
             try:
                 # Notify citizens within 500m radius
                 from sqlalchemy import func as sql_func
@@ -372,7 +429,7 @@ async def create_issue(
                             except Exception:
                                 pass  # Non-critical
 
-                issue.sos_radius_notified = True
+                issue.sos_radius_notified = True  # Set flag to prevent duplicate broadcasts
                 db.commit()
                 logger.warning(
                     f"SOS broadcast completed",
@@ -451,67 +508,81 @@ async def create_issue(
         )
 
     # ── SOS Auto-Broadcast: alert nearby citizens + all admins ──────────
+    # FIX: HIGH PRIORITY BUG #2 - Duplicate SOS broadcasts due to race condition
+    # Use row-level locking to prevent concurrent broadcast
     if body.is_sos:
         try:
-            from app.services.notification_service import _send_fcm, notify_localized
-            from math import pi, acos, sin, cos
-
-            R = 6371  # Earth radius in km
-            SOS_RADIUS_KM = 0.5  # 500m radius
-            lat_rad = body.latitude * pi / 180.0
-            lon_rad = body.longitude * pi / 180.0
-
-            # Alert all citizens within 500m
-            nearby_citizens = (
-                db.query(User)
-                .filter(
-                    User.is_active == True,
-                    User.latitude.isnot(None),
-                    User.longitude.isnot(None),
-                )
-                .all()
+            # Lock the issue row to prevent concurrent SOS broadcasts
+            locked_issue = (
+                db.query(Issue)
+                .filter(Issue.id == issue.id)
+                .with_for_update()  # Row-level lock
+                .first()
             )
-            notified = 0
-            for citizen in nearby_citizens:
-                try:
-                    c_lat = (citizen.latitude or 0) * pi / 180.0
-                    c_lon = (citizen.longitude or 0) * pi / 180.0
-                    cos_angle = max(-1, min(1,
-                        sin(lat_rad) * sin(c_lat) + cos(lat_rad) * cos(c_lat) * cos(c_lon - lon_rad)
-                    ))
-                    dist = R * acos(cos_angle)
-                    if dist <= SOS_RADIUS_KM:
-                        from app.services.notification_service import notify as _notify_sos
-                        _notify_sos(
-                            db=db,
-                            user_id=str(citizen.id),
-                            title="DANGER: Hazard Near You",
-                            body=f"Critical hazard reported near {issue.address or 'your area'}. Please avoid the area.",
-                            notification_type="system",
-                            issue_id=str(issue.id),
-                            fcm_token=citizen.fcm_token,
-                        )
-                        notified += 1
-                except Exception:
-                    pass
+            
+            # Check if already broadcast (double-check pattern)
+            if not locked_issue.sos_radius_notified:
+                from app.services.notification_service import _send_fcm, notify_localized
+                from math import pi, acos, sin, cos
 
-            issue.sos_radius_notified = True
-            db.commit()
-            logger.warning(f"SOS broadcast: {notified} citizens alerted within 500m")
+                R = 6371  # Earth radius in km
+                SOS_RADIUS_KM = 0.5  # 500m radius
+                lat_rad = body.latitude * pi / 180.0
+                lon_rad = body.longitude * pi / 180.0
 
-            # Notify ALL admins immediately
-            admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()
-            for admin_user in admins:
-                notify_localized(
-                    db=db, user=admin_user, key="sos_alert",
-                    notification_type="system",
-                    issue_id=str(issue.id),
-                    issue_id_short=str(issue.id)[:8],
-                    issue_type=issue.issue_type,
-                    address=issue.address or "Unknown",
-                    ward=issue.ward or "unknown",
+                # Alert all citizens within 500m
+                nearby_citizens = (
+                    db.query(User)
+                    .filter(
+                        User.is_active == True,
+                        User.latitude.isnot(None),
+                        User.longitude.isnot(None),
+                    )
+                    .all()
                 )
-            logger.info(f"SOS alert sent to {len(admins)} admin(s)")
+                notified = 0
+                for citizen in nearby_citizens:
+                    try:
+                        c_lat = (citizen.latitude or 0) * pi / 180.0
+                        c_lon = (citizen.longitude or 0) * pi / 180.0
+                        cos_angle = max(-1, min(1,
+                            sin(lat_rad) * sin(c_lat) + cos(lat_rad) * cos(c_lat) * cos(c_lon - lon_rad)
+                        ))
+                        dist = R * acos(cos_angle)
+                        if dist <= SOS_RADIUS_KM:
+                            from app.services.notification_service import notify as _notify_sos
+                            _notify_sos(
+                                db=db,
+                                user_id=str(citizen.id),
+                                title="DANGER: Hazard Near You",
+                                body=f"Critical hazard reported near {issue.address or 'your area'}. Please avoid the area.",
+                                notification_type="system",
+                                issue_id=str(issue.id),
+                                fcm_token=citizen.fcm_token,
+                            )
+                            notified += 1
+                    except Exception:
+                        pass
+
+                issue.sos_radius_notified = True
+                db.commit()
+                logger.warning(f"SOS broadcast: {notified} citizens alerted within 500m")
+
+                # Notify ALL admins immediately
+                admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()
+                for admin_user in admins:
+                    notify_localized(
+                        db=db, user=admin_user, key="sos_alert",
+                        notification_type="system",
+                        issue_id=str(issue.id),
+                        issue_id_short=str(issue.id)[:8],
+                        issue_type=issue.issue_type,
+                        address=issue.address or "Unknown",
+                        ward=issue.ward or "unknown",
+                    )
+                logger.info(f"SOS alert sent to {len(admins)} admin(s)")
+            else:
+                logger.info(f"SOS broadcast already sent for issue {issue.id}, skipping duplicate")
         except Exception as e:
             logger.error(f"SOS broadcast failed (non-fatal): {e}")
 
@@ -1285,6 +1356,9 @@ def update_issue(
 
         if current_user.role in ("worker", "admin"):
             if body.status is not None:
+                # FIX: HIGH PRIORITY BUG #3 - Validate status transitions
+                _validate_status_transition(issue.status, body.status, current_user.role)
+                
                 # Urgent/high priority issues require an after-photo before resolving
                 if (
                     body.status == "resolved"
@@ -1405,6 +1479,7 @@ def add_comment(
     Raises:
         403: User doesn't have access to this issue.
         404: Issue not found.
+        400: Comment nesting exceeds maximum depth (prevents DoS via deep replies).
     """
     issue = db.query(Issue).filter(Issue.id == issue_id).first()
     if not issue:
@@ -1412,6 +1487,9 @@ def add_comment(
 
     _check_comment_access(issue, current_user)
 
+    # MEDIUM PRIORITY BUG FIX #3: Comment nesting DoS protection
+    MAX_COMMENT_DEPTH = 5
+    
     # Validate parent_id if provided
     if body.parent_id:
         parent = db.query(IssueComment).filter(
@@ -1420,6 +1498,22 @@ def add_comment(
         ).first()
         if not parent:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent comment not found")
+        
+        # Check nesting depth to prevent DoS
+        depth = 1
+        current_parent = parent
+        while current_parent.parent_id:
+            depth += 1
+            current_parent = db.query(IssueComment).filter(
+                IssueComment.id == current_parent.parent_id
+            ).first()
+            if not current_parent:
+                break
+            if depth >= MAX_COMMENT_DEPTH:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Comment nesting exceeds maximum depth of {MAX_COMMENT_DEPTH} levels"
+                )
 
     # Only workers and admins may post internal notes; silently downgrade for citizens
     is_internal = body.is_internal and current_user.role in (

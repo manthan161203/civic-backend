@@ -31,15 +31,39 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+
+# FIX MEDIUM PRIORITY BUG #6: Request size limit middleware
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware to limit request body size.
+    
+    Prevents DoS attacks via large payloads.
+    Default limit: 10 MB
+    """
+    def __init__(self, app, max_body_size: int = 10 * 1024 * 1024):  # 10 MB default
+        super().__init__(app)
+        self.max_body_size = max_body_size
+    
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ["POST", "PUT", "PATCH"]:
+            if "content-length" in request.headers:
+                content_length = int(request.headers["content-length"])
+                if content_length > self.max_body_size:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": f"Request body too large (max {self.max_body_size // (1024*1024)} MB)"}
+                    )
+        return await call_next(request)
+
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.database import SessionLocal, check_db_connection, engine, dispose_pool
-from app.routes import admin, auth, chat, citizen_features, complaints, features, issues, locations, notifications, optimization, public, rewards, setup, sync, workers
+from app.routes import admin, auth, chat, citizen_features, complaints, features, health, issues, locations, notifications, optimization, public, rewards, setup, sync, workers
 from app.services.pool_monitor import PoolHealthCheckThread
 from app.services.utils import get_users_by_role, get_users_with_roles
 
@@ -84,6 +108,8 @@ _origins = (
     ["*"] if settings.CORS_ORIGINS.strip() == "*"
     else [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
 )
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -91,6 +117,10 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=_origins != ["*"],
 )
+
+# MEDIUM PRIORITY BUG FIX #6: Add request size limit middleware
+max_body_size = int(os.getenv("MAX_BODY_SIZE", 10 * 1024 * 1024))  # 10 MB default
+app.add_middleware(RequestSizeLimitMiddleware, max_body_size=max_body_size)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -397,6 +427,7 @@ def pool_health_check():
 
 
 # Routers
+app.include_router(health.router)  # Health check endpoints (should be first)
 app.include_router(setup.router)
 app.include_router(auth.router)
 app.include_router(features.router)   # must be before issues — /issues/search must not be shadowed by /issues/{issue_id}

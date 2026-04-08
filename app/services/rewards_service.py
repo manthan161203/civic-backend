@@ -143,6 +143,9 @@ def award_event(
 
     This function is non-fatal — any exception is logged and swallowed
     so that reward failures never block the main action.
+    
+    FIX: HIGH PRIORITY BUG #6 - Concurrent reward isolation
+    Points and badge unlocks are now in the same transaction.
 
     Args:
         db:           SQLAlchemy session (caller must commit after calling this
@@ -161,6 +164,17 @@ def award_event(
             logger.warning(f"Unknown reward event: {event}")
             return
 
+        # IDEMPOTENCY CHECK: Don't create duplicate transactions for same event on same reference
+        if reference_id:
+            existing = db.query(RewardTransaction).filter(
+                RewardTransaction.user_id == user_id,
+                RewardTransaction.event_type == event,
+                RewardTransaction.reference_id == reference_id,
+            ).first()
+            if existing:
+                logger.info(f"Reward already awarded: user {user_id} +{points} pts ({event}) for reference {reference_id}")
+                return
+
         tx = RewardTransaction(
             id=uuid.uuid4(),
             user_id=user_id,
@@ -170,18 +184,20 @@ def award_event(
             note=note or f"+{points} for {event}",
         )
         db.add(tx)
+        
+        # FIX: Check badge unlocks BEFORE commit (in same transaction)
+        _check_badge_unlocks(db, user_id, event)
+        
+        # Single commit for both points and badges
         db.commit()
         logger.info(f"Reward: user {user_id} +{points} pts ({event})")
 
-        # Check if any new badges are unlocked after this transaction
-        _check_badge_unlocks(db, user_id, event)
-
     except Exception as e:
-        logger.warning(f"Reward award failed (non-fatal): {e}")
+        logger.error(f"Reward award failed for user {user_id} event {event}: {e}", exc_info=True, extra={"user_id": str(user_id), "event_type": event})
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_err:
+            logger.error(f"Rollback also failed: {rollback_err}", exc_info=True)
 
 
 def get_user_summary(db: Session, user_id: uuid.UUID) -> dict:
@@ -452,11 +468,11 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
                 _grant("streak_master")
 
     except Exception as e:
-        logger.warning(f"Badge check failed (non-fatal): {e}")
+        logger.error(f"Badge check failed for user {user_id}: {e}", exc_info=True, extra={"user_id": str(user_id)})
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_err:
+            logger.error(f"Rollback also failed during badge check: {rollback_err}", exc_info=True)
 
 
 # ── Weekly streak checker (called from auto-escalation loop or cron) ─────────

@@ -143,3 +143,4 @@ mypy==1.7.1
 factory-boy==3.3.0
 faker==21.0.0
 pytest-env==1.1.1
+bleach==6.3.0
