@@ -108,11 +108,11 @@ class Issue(Base):
     is_blocked = Column(Boolean, default=False, nullable=False, index=True)
     blocked_reason = Column(Text, nullable=True)
     blocked_at = Column(DateTime(timezone=True), nullable=True)  # When worker blocked
-    blocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)  # Worker who blocked
+    blocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)  # Worker who blocked
     
     # Admin unblock tracking
     unblocked_at = Column(DateTime(timezone=True), nullable=True)  # When admin unblocked
-    unblocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)  # Admin who unblocked
+    unblocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)  # Admin who unblocked
     admin_unblock_note = Column(Text, nullable=True)  # Admin's reason for unblocking
     block_resolved_by = Column(String(50), nullable=True)  # 'reassign' | 'unblock' | 'resolve' | 'other'
 

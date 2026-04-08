@@ -34,7 +34,7 @@ class IssueSquad(Base):
     lead_worker_id = Column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     # JSON array of assistant worker UUIDs (strings)
