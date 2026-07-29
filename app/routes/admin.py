@@ -63,7 +63,7 @@ from app.schemas.auth import UserResponse
 # Admins get the variants carrying the reporter's phone number. Every other
 # router uses the plain IssueResponse, which has no phone field to emit — see
 # the docstring on IssueReporterInfo.
-from app.schemas.issue import IssueAdminListResponse, IssueAdminResponse
+from app.schemas.issue import IssueAdminListResponse, IssueAdminResponse, IssueStatusEnum
 from app.services.utils import (
     apply_not_deleted_filter,
     apply_active_filter,
@@ -77,6 +77,15 @@ from app.core.exceptions import ResourceNotFoundError, ValidationError, Processi
 logger = get_logger("admin")
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
+# Derived from the schema enum, not retyped.
+#
+# `Issue.status` is a native Postgres enum, so a value outside this set does not
+# return zero rows — psycopg raises `invalid input value for enum issue_status`,
+# which the list handler's `except Exception` turns into a 500. Reading the set
+# off `IssueStatusEnum` means a status added to the model cannot drift out of
+# the validator that guards against exactly that.
+ISSUE_STATUS_VALUES = tuple(s.value for s in IssueStatusEnum)
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -147,6 +156,12 @@ def list_all_issues(
     severity: Optional[str] = Query(None),
     priority: Optional[str] = Query(None, description="Filter by priority: urgent/high/medium/low"),
     department: Optional[str] = Query(None, description="Filter by department"),
+    is_escalated: Optional[bool] = Query(
+        None, description="True lists only escalated issues."
+    ),
+    is_blocked: Optional[bool] = Query(
+        None, description="True lists only issues a worker has flagged as blocked."
+    ),
     ai_flag: Optional[str] = Query(
         None,
         description="Drill-down for the insights screen: low_confidence | poor_resolution",
@@ -160,11 +175,35 @@ def list_all_issues(
     server-side. It previously fetched up to 2,000 issues and filtered them in
     the browser, which both truncated the result and made the counts a sample.
 
+    ``is_escalated`` / ``is_blocked`` are separate from ``status`` on purpose,
+    because that is how the data is actually shaped. ``Issue.status`` is a
+    Postgres enum of exactly five values and escalation and blocking are
+    boolean columns alongside it — an issue can be `in_progress` *and*
+    escalated. The console offered "escalated" as a status for a long time,
+    which produced a 500 rather than an empty list (see the guard below), and
+    left no way to list escalated issues at all.
+
     **Roles**: any admin.
     """
     # Validated before the try: the handler's `except Exception` turns anything
     # raised inside into a 500, so a deliberate 422 raised in there would reach
     # the client as "Failed to fetch issues".
+    #
+    # `status` needs this more than the others do. It is a native Postgres enum,
+    # so an unrecognised value is not an empty result — psycopg raises
+    # `invalid input value for enum issue_status`, which the except below turns
+    # into a 500. `escalated` and `blocked` are the two that were actually being
+    # sent, which is why they are named in the message.
+    if status_filter is not None and status_filter not in ISSUE_STATUS_VALUES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"status must be one of {', '.join(ISSUE_STATUS_VALUES)}. "
+                "Escalation and blocking are not statuses — use is_escalated "
+                "or is_blocked."
+            ),
+        )
+
     if ai_flag is not None and ai_flag not in ("low_confidence", "poor_resolution"):
         # Not silently ignored — an unrecognised value returning the unfiltered
         # list would show every issue under a "low confidence" tab.
@@ -185,6 +224,10 @@ def list_all_issues(
             query = query.filter(Issue.ward == ward)
         if severity:
             query = query.filter(Issue.severity == severity)
+        if is_escalated is not None:
+            query = query.filter(Issue.is_escalated == is_escalated)
+        if is_blocked is not None:
+            query = query.filter(Issue.is_blocked == is_blocked)
         if priority:
             query = query.filter(Issue.priority == priority)
         if department:
@@ -2346,19 +2389,36 @@ def list_active_overrides(
         # Apply pagination
         overrides = query.order_by(AdminOverride.created_at.desc()).offset((page - 1) * size).limit(size).all()
         
-        # Build response with admin names
-        override_list = []
-        for o in overrides:
-            # Get admin names
-            granted_to = db.query(UserModel).filter(UserModel.id == o.granted_to_admin_id).first()
-            
-            override_list.append({
+        # One query for every name on the page, not one per row.
+        #
+        # This loop used to issue a `SELECT ... WHERE id = ?` per override, so a
+        # full page of twenty cost twenty-one round trips to render a column of
+        # names. Grants also cluster on a handful of admins, so most of those
+        # queries were fetching a row already fetched.
+        admin_ids = {o.granted_to_admin_id for o in overrides}
+        names = (
+            dict(
+                db.query(UserModel.id, UserModel.name)
+                .filter(UserModel.id.in_(admin_ids))
+                .all()
+            )
+            if admin_ids
+            else {}
+        )
+
+        override_list = [
+            {
                 "id": str(o.id),
-                "admin_name": granted_to.name if granted_to else "Unknown",
+                # "Unknown" rather than omitting the row: a grant whose grantee
+                # has been deleted is exactly the thing a super-admin auditing
+                # this screen needs to see.
+                "admin_name": names.get(o.granted_to_admin_id, "Unknown"),
                 "target_scope": f"{o.scope_level}:{o.target_scope_id}",
                 "reason": o.reason,
                 "override_until": o.override_until.isoformat() if o.override_until else None,
-            })
+            }
+            for o in overrides
+        ]
         
         return {
             "status": "success",
