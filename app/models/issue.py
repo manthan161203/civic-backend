@@ -16,10 +16,11 @@ Key design decisions:
 
 import uuid
 
-from sqlalchemy import Boolean, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text, event, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import relationship
 
+from app.core.time import now_utc
 from app.database import Base
 
 
@@ -27,7 +28,21 @@ class Issue(Base):
     __tablename__ = "issues"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    reporter_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    # RESTRICT, stated explicitly. This was the only user FK in the codebase
+    # with no `ondelete` at all — every sibling declares one (Notification
+    # CASCADE, IssueVote CASCADE, Geofence SET NULL, even Issue.blocked_by_id
+    # SET NULL) — so it silently inherited NO ACTION.
+    #
+    # The behaviour is the same, but the intent now is not ambiguous: an issue
+    # is a civic record and must outlive its reporter's account, so a hard
+    # DELETE of a user who has reported anything is refused. Account removal is
+    # a soft delete (DELETE /auth/account), which is what the erasure path uses.
+    reporter_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     assigned_worker_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
     parent_issue_id = Column(UUID(as_uuid=True), ForeignKey("issues.id"), nullable=True)
 
@@ -107,7 +122,7 @@ class Issue(Base):
     # Blocked by worker — with admin resolution tracking
     is_blocked = Column(Boolean, default=False, nullable=False, index=True)
     blocked_reason = Column(Text, nullable=True)
-    blocked_at = Column(DateTime(timezone=True), nullable=True)  # When worker blocked
+    blocked_at = Column(DateTime(timezone=True), nullable=True, index=True)  # When worker blocked
     blocked_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)  # Worker who blocked
     
     # Admin unblock tracking
@@ -118,9 +133,29 @@ class Issue(Base):
 
     # Rejection tracking — auto-escalates after 3 rejections
     reassignment_count = Column(Integer, server_default="0", nullable=False)
+
+    # When the current worker was assigned. Stamped by the event listener at the
+    # bottom of this module so no assignment path can forget it.
+    #
+    # Two things depend on it. The reclaim pass in app/main.py uses it to find
+    # assignments a worker never started, which is the feature the (deleted)
+    # app/services/worker_utils.py claimed to provide by querying a `queued_at`
+    # column and a `queued` status that have never existed. And the fast_resolve
+    # reward measures elapsed work from here — it previously measured from
+    # updated_at, which `onupdate=func.now()` had just set to the same instant
+    # as resolved_at, so every resolution scored 0.0 hours and earned the bonus.
+    assigned_at = Column(DateTime(timezone=True), nullable=True, index=True)
     # JSON list of worker UUIDs (as strings) who have rejected this issue — used to
     # exclude all prior rejecters when finding the next worker, not just the last one.
-    rejected_by_ids = Column(JSON, default=list, nullable=False, server_default="'[]'")
+    # server_default must be a text() clause, not a plain string. As a string,
+    # SQLAlchemy quotes it as a literal and the embedded quotes get doubled,
+    # emitting `DEFAULT '''[]'''` — which Postgres rejects as invalid JSON. The
+    # live table was created by a migration so the app never hit this, but it
+    # made Base.metadata.create_all() fail outright, which is how the test suite
+    # builds its schema. The database's actual default is `'[]'::json`.
+    rejected_by_ids = Column(
+        JSON, default=list, nullable=False, server_default=text("'[]'::json")
+    )
 
     # Soft-delete — admin can remove an issue without destroying citizen records
     is_deleted = Column(Boolean, server_default="false", nullable=False)
@@ -146,3 +181,22 @@ class Issue(Base):
         if self.assigned_worker is not None:
             return self.assigned_worker.name or self.assigned_worker.phone
         return None
+
+
+@event.listens_for(Issue.assigned_worker_id, "set")
+def _stamp_assigned_at(target: "Issue", value, oldvalue, _initiator):
+    """Keep ``assigned_at`` in step with ``assigned_worker_id`` automatically.
+
+    There are eight places in the codebase that assign a worker — auto-routing,
+    two admin paths, bulk assign, squad creation, worker accept, the issue PATCH
+    handler and offline sync — and more will be added. Requiring each of them to
+    remember a second write is how columns like this drift out of sync. Doing it
+    here means an assignment cannot happen without the timestamp.
+
+    Clearing the worker clears the timestamp, so a reclaimed or unassigned issue
+    does not look like it has been sitting assigned since whenever it last was.
+    """
+    if value is None:
+        target.assigned_at = None
+    elif value != oldvalue:
+        target.assigned_at = now_utc()

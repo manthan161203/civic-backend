@@ -11,54 +11,19 @@ ADMIN ROLES AUDIT - GAP #1: Admin-to-Admin Communication
 """
 
 import uuid
-from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship, Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
+from app.core.time import now_utc
 from app.core.logger import get_logger
-from app.database import Base
-from app.models import User
+from app.models import AdminMessage, User
 
 logger = get_logger(__name__)
 
-
-class AdminMessage(Base):
-    """Message between admins for coordination and escalation."""
-    
-    __tablename__ = "admin_messages"
-    
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    
-    # Sender and receiver
-    sender_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    receiver_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    
-    # Message content
-    subject = Column(String(255), nullable=False)
-    body = Column(Text, nullable=False)
-    message_type = Column(String(50), default="general")  # "general", "issue", "worker", "incident", "escalation"
-    
-    # Related resource (optional - can reference an issue/worker)
-    related_resource_type = Column(String(50), nullable=True)  # "issue", "worker", "incident"
-    related_resource_id = Column(UUID(as_uuid=True), nullable=True)
-    
-    # Status
-    is_read = Column(DateTime(timezone=True), nullable=True)  # When read (null = unread)
-    is_urgent = Column(String(50), default="normal")  # "normal", "urgent", "critical"
-    
-    # Audit
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-    
-    # Relationships
-    sender = relationship("User", foreign_keys=[sender_id], back_populates="messages_sent")
-    receiver = relationship("User", foreign_keys=[receiver_id], back_populates="messages_received")
-    
-    def __repr__(self):
-        return f"<AdminMessage {self.id} from {self.sender_id} to {self.receiver_id}>"
+# ``AdminMessage`` moved to app/models/admin_message.py so it is registered on
+# Base.metadata with every other model. Re-exported here for existing importers.
 
 
 def send_admin_message(
@@ -117,28 +82,77 @@ def send_admin_message(
     return message
 
 
-def get_inbox(admin_id: uuid.UUID, unread_only: bool = False, db: Optional[Session] = None) -> List[AdminMessage]:
+def get_inbox(
+    admin_id: uuid.UUID,
+    unread_only: bool = False,
+    db: Optional[Session] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> List[AdminMessage]:
     """Get messages for an admin (inbox)."""
     if not db:
         return []
     
-    query = db.query(AdminMessage).filter(AdminMessage.receiver_id == admin_id)
+    # joinedload: the route renders m.sender.name for every row, which without
+    # this issues one SELECT per message.
+    query = (
+        db.query(AdminMessage)
+        .options(joinedload(AdminMessage.sender), joinedload(AdminMessage.receiver))
+        .filter(AdminMessage.receiver_id == admin_id)
+    )
     if unread_only:
         query = query.filter(AdminMessage.is_read.is_(None))
     
-    return query.order_by(AdminMessage.created_at.desc()).all()
+    query = query.order_by(AdminMessage.created_at.desc())
+    # Paginate in SQL. The caller used to fetch every message the admin had ever
+    # received and slice the list in Python.
+    if offset:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return query.all()
 
 
-def get_sent_messages(admin_id: uuid.UUID, db: Optional[Session] = None) -> List[AdminMessage]:
+def get_sent_messages(
+    admin_id: uuid.UUID,
+    db: Optional[Session] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> List[AdminMessage]:
     """Get messages sent by an admin (sent items)."""
     if not db:
         return []
     
-    return (
+    query = (
         db.query(AdminMessage)
+        .options(joinedload(AdminMessage.sender), joinedload(AdminMessage.receiver))
         .filter(AdminMessage.sender_id == admin_id)
         .order_by(AdminMessage.created_at.desc())
-        .all()
+    )
+    if offset:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return query.all()
+
+
+def count_inbox(admin_id: uuid.UUID, db: Session, unread_only: bool = False) -> int:
+    """Count an admin's received messages, for pagination totals."""
+    query = db.query(func.count(AdminMessage.id)).filter(
+        AdminMessage.receiver_id == admin_id
+    )
+    if unread_only:
+        query = query.filter(AdminMessage.is_read.is_(None))
+    return query.scalar() or 0
+
+
+def count_sent(admin_id: uuid.UUID, db: Session) -> int:
+    """Count an admin's sent messages, for pagination totals."""
+    return (
+        db.query(func.count(AdminMessage.id))
+        .filter(AdminMessage.sender_id == admin_id)
+        .scalar()
+        or 0
     )
 
 
@@ -149,7 +163,7 @@ def mark_read(message_id: uuid.UUID, db: Optional[Session] = None) -> AdminMessa
     
     message = db.query(AdminMessage).filter(AdminMessage.id == message_id).first()
     if message:
-        message.is_read = datetime.utcnow()
+        message.is_read = now_utc()
         db.commit()
         db.refresh(message)
     

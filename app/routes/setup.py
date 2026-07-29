@@ -4,11 +4,15 @@ One-Time Setup Route
 Bootstraps the first admin account when no admin exists in the system.
 
 Security model:
-- The endpoint is **permanently disabled** once any admin account exists.
+- The endpoint is **permanently disabled** once any admin account exists —
+  active or not. It used to require ``is_active == True``, which meant
+  deactivating the only admin silently re-opened an unauthenticated endpoint
+  that mints a new super-admin.
 - Returns 403 if called again after the first admin is created.
 - Should be called once right after the first deployment/migration.
-- In production, set DEV_MODE=False — the endpoint still works but is protected
-  by the "no admins exist" guard.
+- In production, ``SETUP_TOKEN`` must be set and sent as the ``X-Setup-Token``
+  header. Otherwise the window between migrating and creating the first admin
+  is an open door: whoever reaches it first becomes super-admin.
 
 Frontend Integration:
     Check GET /setup/status first — if {"setup_required": false}, skip this screen.
@@ -16,10 +20,13 @@ Frontend Integration:
 
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import secrets as _secrets
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.user import User
@@ -84,7 +91,8 @@ def setup_status(db: Session = Depends(get_db)):
         ``{"setup_required": false}`` — admin exists, go to login.
     """
     try:
-        admin_exists = check_resource_exists(User, (User.role == "admin") & (User.is_active == True), db)
+        # Existence, not activeness — see the module docstring.
+        admin_exists = check_resource_exists(User, User.role == "admin", db)
     except Exception as e:
         logger.error(f"Error checking setup status: {e}", exc_info=True)
         raise HTTPException(
@@ -95,8 +103,48 @@ def setup_status(db: Session = Depends(get_db)):
     return SetupStatusResponse(setup_required=not admin_exists)
 
 
+def _check_setup_token(provided: str | None) -> None:
+    """In production, require a matching ``X-Setup-Token`` header.
+
+    The lock below only holds once an admin exists. Between running migrations
+    and creating that admin, this endpoint is an unauthenticated way to mint a
+    super-admin, so production additionally requires a shared secret.
+    ``validate_settings()`` warns when ``SETUP_TOKEN`` is unset.
+
+    Raises:
+        HTTPException: 403 if the token is missing or wrong.
+    """
+    if not settings.is_production:
+        return
+
+    expected = settings.SETUP_TOKEN
+    if not expected:
+        logger.error("SETUP_TOKEN is not configured — refusing unauthenticated setup")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Setup is not available.",
+        )
+
+    # compare_digest: the comparison is against a secret, so it should not leak
+    # the matching prefix length through timing.
+    if not provided or not _secrets.compare_digest(provided, expected):
+        logger.warning("POST /setup/admin called with a missing or invalid setup token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Setup is not available.",
+        )
+
+
 @router.post("/admin", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def create_first_admin(body: AdminSetupRequest, db: Session = Depends(get_db)):
+def create_first_admin(
+    body: AdminSetupRequest,
+    db: Session = Depends(get_db),
+    x_setup_token: str | None = Header(
+        None,
+        alias="X-Setup-Token",
+        description="Required in production; must match SETUP_TOKEN.",
+    ),
+):
     """Create the first admin account (one-time setup only).
 
     This endpoint is **permanently disabled** once any admin account exists.
@@ -112,13 +160,18 @@ def create_first_admin(body: AdminSetupRequest, db: Session = Depends(get_db)):
         ``UserResponse`` of the newly created admin.
 
     Raises:
-        403: An admin account already exists — setup is locked.
+        403: An admin account already exists (setup is locked), or the
+             ``X-Setup-Token`` header is missing/invalid in production.
         409: Phone number is already registered to another account.
         422: Validation error in request body.
     """
+    _check_setup_token(x_setup_token)
+
     try:
-        # Lock: if any admin exists, this endpoint is disabled permanently
-        admin_exists = check_resource_exists(User, (User.role == "admin") & (User.is_active == True), db)
+        # Lock: if any admin exists — active or not — this endpoint is disabled
+        # permanently. Checking is_active meant deactivating the sole admin
+        # re-opened it.
+        admin_exists = check_resource_exists(User, User.role == "admin", db)
 
         if admin_exists:
             logger.warning("POST /setup/admin called but admin already exists — blocked")

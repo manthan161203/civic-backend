@@ -42,7 +42,9 @@ class Dispute(Base):
         index=True,
     )
     admin_notes = Column(Text, nullable=True)
-    resolved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    resolved_by = Column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

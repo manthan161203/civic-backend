@@ -15,12 +15,13 @@ Refresh Token Design:
 import hashlib
 import secrets
 import string
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
+from app.core.time import now_utc
 from app.core.config import settings
 from app.core.logger import get_logger
 
@@ -75,11 +76,18 @@ def create_refresh_token(user_id: str, db: Session, commit: bool = True) -> str:
     """
     from app.models.refresh_token import RefreshToken
 
-    expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    expires_at = now_utc() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     payload = {
         "sub": str(user_id),
         "type": "refresh",
         "exp": expires_at,
+        # Without a unique claim the payload is {sub, type, exp} and `exp` only
+        # has second resolution, so two logins by the same user in the same
+        # second produce a byte-identical JWT. That collided on the token_hash
+        # unique index and returned a 500, and it also meant the two sessions
+        # shared one token — defeating the per-session revocation this table
+        # exists for.
+        "jti": secrets.token_urlsafe(16),
     }
     token = jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     token_hash = _hash_token(token)
@@ -143,14 +151,14 @@ def validate_refresh_token(token: str, db: Session) -> Optional[str]:
             .filter(
                 RefreshToken.token_hash == token_hash,
                 RefreshToken.is_revoked == False,
-                RefreshToken.expires_at > datetime.utcnow(),
+                RefreshToken.expires_at > now_utc(),
             )
             .with_for_update()  # row-level lock prevents concurrent refresh race
             .first()
         )
 
     try:
-        record = execute_with_retry(query_token_from_db, config=STANDARD_RETRY)
+        record = execute_with_retry(query_token_from_db, config=STANDARD_RETRY, session=db)
     except Exception as e:
         logger.error(f"Failed to validate refresh token after retries: {e}", exc_info=True)
         raise  # Re-raise so the route handler can catch and return 500

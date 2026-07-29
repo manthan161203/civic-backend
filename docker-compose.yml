@@ -1,14 +1,111 @@
-version: "3.9"
+name: civic
+
+# ── Shared fragments ─────────────────────────────────────────────────────────
+x-api-build: &api-build
+  context: .
+  args:
+    UID: ${UID:-1000}
+    GID: ${GID:-1000}
+
+# .env is optional so the stack still comes up on a fresh clone.
+x-api-envfile: &api-envfile
+  - path: .env
+    required: false
+
+# DATABASE_URL is built here rather than read from .env so it can never drift
+# from the POSTGRES_* values the db service is actually using. Values set in
+# `environment:` override anything with the same key in `env_file:`.
+x-api-env: &api-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-civic}:${POSTGRES_PASSWORD:-civic}@db:5432/${POSTGRES_DB:-civic}
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # In a container, stdout is the log — the json-file driver above captures and
+  # rotates it. File logging is off for a second reason too: `api` (2 uvicorn
+  # workers) and `jobs` both mounted the same logs volume and both opened the
+  # same civic_YYYY-MM-DD.log, so three TimedRotatingFileHandlers raced on one
+  # doRollover() at midnight. Whichever won renamed the file out from under the
+  # others, which kept writing to an unlinked inode.
+  LOG_TO_FILE: "false"
+
+# Docker's default json-file driver has no size cap, so container stdout grows
+# until it fills the disk. Every long-running service gets this.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
 
 services:
+  # ── Database ───────────────────────────────────────────────────────────────
+  # postgres 16 (not alpine): the app stores Gujarati/Hindi text, and musl vs
+  # glibc collation differences change ORDER BY results and break index
+  # compatibility on dump/restore into a glibc-based managed Postgres.
+  db:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-civic}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civic}
+      POSTGRES_DB: ${POSTGRES_DB:-civic}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Loopback-bound so the DB is never exposed to the LAN. 5434 avoids
+    # colliding with the Postgres instances already on the host (5432, 5433).
+    ports:
+      - "127.0.0.1:${DB_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civic} -d ${POSTGRES_DB:-civic}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+    # Without a memory limit a leak anywhere on this host OOM-kills whichever
+    # process the kernel picks — and the API and the database are siblings on
+    # the same host, so that can be the database.
+    mem_limit: 1g
+    cpus: 1.0
+
+  # ── One-shot migrations ────────────────────────────────────────────────────
+  # Needs SECRET_KEY as well as DATABASE_URL: alembic/env.py imports
+  # app.core.config, and SECRET_KEY has no default.
+  migrate:
+    build: *api-build
+    env_file: *api-envfile
+    environment: *api-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    # The image HEALTHCHECK curls :8000/health/live. This container runs alembic
+    # and exits; it never serves HTTP. Inheriting that check makes it report
+    # unhealthy for its whole (short) life. Its real success signal is the exit
+    # code, which `service_completed_successfully` below already gates on.
+    healthcheck:
+      disable: true
+
+  # ── API ────────────────────────────────────────────────────────────────────
+  # RUN_BACKGROUND_JOBS=false: the hourly escalation loop and the pool monitor
+  # start once per uvicorn worker process, so running them here would duplicate
+  # escalations and reward grants as soon as --workers goes above 1. They run in
+  # the `jobs` service instead, which is why this can scale workers freely.
   api:
-    build: .
-    env_file: .env
+    build: *api-build
+    env_file: *api-envfile
+    environment:
+      <<: *api-env
+      RUN_BACKGROUND_JOBS: "false"
     ports:
       - "${PORT:-8000}:8000"
     volumes:
-      # Persist local uploads between restarts
       - uploads_data:/app/uploads
+      # Firebase service-account JSON. .dockerignore excludes credentials/ from
+      # the build context (correct — secrets do not belong in an image), but
+      # nothing mounted it either, so PUSH_BACKEND=fcm hard-failed startup with
+      # no documented way to fix it. Optional: the directory need not exist when
+      # push notifications are off.
+      - ./credentials:/app/credentials:ro
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
@@ -16,20 +113,74 @@ services:
       --workers ${UVICORN_WORKERS:-2}
       --limit-concurrency 100
       --timeout-keep-alive 30
-    restart: unless-stopped
+      --proxy-headers
+      --forwarded-allow-ips ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 20s
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: ${API_MEM_LIMIT:-1g}
+    cpus: ${API_CPUS:-2.0}
+    pids_limit: 512
 
-  # Development profile — adds --reload and mounts source code
+  # ── Background jobs ────────────────────────────────────────────────────────
+  # Exactly one replica. Runs the same image with no HTTP server: the lifespan
+  # handler starts the escalation loop and pool monitor, and the loop also takes
+  # a Postgres advisory lock so a second runner cannot double-process a cycle.
+  jobs:
+    build: *api-build
+    env_file: *api-envfile
+    environment:
+      <<: *api-env
+      RUN_BACKGROUND_JOBS: "true"
+    volumes:
+      - uploads_data:/app/uploads
+      - ./credentials:/app/credentials:ro
+    command: ["python", "-m", "app.jobs"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: ${JOBS_MEM_LIMIT:-512m}
+    cpus: ${JOBS_CPUS:-1.0}
+    pids_limit: 256
+    # Same reason as `migrate`: this container serves no HTTP, so the image's
+    # curl-based HEALTHCHECK can only ever fail. It sat at "unhealthy" with a
+    # failing streak in the hundreds — which is worse than having no check at
+    # all, because it trains you to ignore the status column. It was doing
+    # exactly that while the escalation loop threw a TypeError every cycle.
+    #
+    # There is no cheap true liveness probe here: the loop sleeps for an hour
+    # between cycles, so any heartbeat file would be stale most of the time and
+    # would signal nothing useful. Liveness for this service is the restart
+    # policy; correctness is Sentry plus the "Auto-escalation" log lines.
+    healthcheck:
+      disable: true
+
+  # ── API, development profile ───────────────────────────────────────────────
+  # Source is bind-mounted and uvicorn reloads on change. Start it with
+  #   docker compose up api-dev
+  # (naming a profiled service enables its profile and starts only it + deps,
+  # so it will not collide with `api` on the published port).
   api-dev:
-    build: .
-    env_file: .env
+    build: *api-build
+    profiles: ["dev"]
+    env_file: *api-envfile
+    environment: *api-env
     ports:
-      - "${PORT:-8000}:8000"
+      - "${DEV_PORT:-8000}:8000"
     volumes:
       - .:/app
       - uploads_data:/app/uploads
@@ -40,9 +191,96 @@ services:
       --reload
       --reload-include "*.py"
       --reload-include ".env"
-    profiles:
-      - dev
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
+  # ── Test suite ─────────────────────────────────────────────────────────────
+  # Runs pytest against a throwaway database in its own container, so the suite
+  # never touches `pgdata` and needs no local Python environment:
+  #
+  #   docker compose run --rm tests
+  #   docker compose run --rm tests pytest tests/test_authz.py -x
+  #
+  # The schema comes from Base.metadata.create_all in tests/conftest.py rather
+  # than from alembic, so a broken migration chain cannot block the tests that
+  # would tell you what broke.
+  testdb:
+    image: postgres:16-bookworm
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: civic
+      POSTGRES_PASSWORD: civic
+      POSTGRES_DB: civic_test
+    # tmpfs, not a volume: this data is disposable by definition and running it
+    # in memory makes the suite noticeably faster.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U civic -d civic_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  tests:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+        INSTALL_DEV: "true"
+    profiles: ["test"]
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql://civic:civic@testdb:5432/civic_test
+      TEST_DATABASE_URL: postgresql://civic:civic@testdb:5432/civic_test
+      SECRET_KEY: test-secret-key-not-for-production-use-0123456789abcdef
+      SMS_BACKEND: console
+      EMAIL_BACKEND: console
+      PUSH_BACKEND: console
+      AADHAAR_BACKEND: console
+      GOOGLE_AUTH_BACKEND: console
+      RUN_BACKGROUND_JOBS: "false"
+      LOG_TO_FILE: "false"
+      LOG_LEVEL: WARNING
+      PUBLIC_BASE_URL: http://testserver
+    command: ["pytest"]
+    depends_on:
+      testdb:
+        condition: service_healthy
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # ── Backups ────────────────────────────────────────────────────────────────
+  # Verified pg_dump into the `backups` volume. Runs on demand or from cron:
+  #
+  #   docker compose --profile backup run --rm backup
+  #
+  # Uses the postgres image (not the app image) so it has pg_dump/pg_restore at
+  # exactly the server's major version — a dump taken by an older client against
+  # a newer server is a restore failure waiting to happen.
+  backup:
+    image: postgres:16-bookworm
+    profiles: ["backup"]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-civic}
+      POSTGRES_USER: ${POSTGRES_USER:-civic}
+      POSTGRES_DB: ${POSTGRES_DB:-civic}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - backups:/backups
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
 volumes:
+  pgdata:
+  backups:
   uploads_data:

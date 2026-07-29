@@ -1,0 +1,26 @@
+district,district_lat,district_lon,taluka,taluka_lat,taluka_lon,ward_number,ward,ward_lat,ward_lon
+Surat,21.1702,72.8311,Surat City,21.1702,72.8311,1,Adajan,21.1900,72.7900
+Surat,21.1702,72.8311,Surat City,21.1702,72.8311,2,Athwa,21.1702,72.8000
+Surat,21.1702,72.8311,Surat City,21.1702,72.8311,3,Katargam,21.2200,72.8300
+Surat,21.1702,72.8311,Surat City,21.1702,72.8311,4,Varachha,21.2050,72.8600
+Surat,21.1702,72.8311,Surat City,21.1702,72.8311,5,Rander,21.2100,72.7800
+Surat,21.1702,72.8311,Choryasi,21.1000,72.8000,6,Dumas,21.0800,72.7100
+Surat,21.1702,72.8311,Bardoli,21.1250,73.1100,7,Bardoli Town,21.1250,73.1100
+Ahmedabad,23.0225,72.5714,Ahmedabad City,23.0225,72.5714,1,Navrangpura,23.0350,72.5600
+Ahmedabad,23.0225,72.5714,Ahmedabad City,23.0225,72.5714,2,Maninagar,22.9960,72.6020
+Ahmedabad,23.0225,72.5714,Ahmedabad City,23.0225,72.5714,3,Bopal,23.0300,72.4700
+Ahmedabad,23.0225,72.5714,Ahmedabad City,23.0225,72.5714,4,Naroda,23.0700,72.6600
+Ahmedabad,23.0225,72.5714,Sanand,22.9900,72.3800,5,Sanand Town,22.9900,72.3800
+Vadodara,22.3072,73.1812,Vadodara City,22.3072,73.1812,1,Alkapuri,22.3100,73.1700
+Vadodara,22.3072,73.1812,Vadodara City,22.3072,73.1812,2,Gotri,22.3200,73.1400
+Vadodara,22.3072,73.1812,Vadodara City,22.3072,73.1812,3,Karelibaug,22.3200,73.2100
+Vadodara,22.3072,73.1812,Padra,22.2400,73.0800,4,Padra Town,22.2400,73.0800
+Rajkot,22.3039,70.8022,Rajkot City,22.3039,70.8022,1,Kalawad Road,22.2800,70.7700
+Rajkot,22.3039,70.8022,Rajkot City,22.3039,70.8022,2,Gondal Road,22.2700,70.8000
+Rajkot,22.3039,70.8022,Rajkot City,22.3039,70.8022,3,University Road,22.2900,70.7400
+Gandhinagar,23.2156,72.6369,Gandhinagar City,23.2156,72.6369,1,Sector 21,23.2200,72.6500
+Gandhinagar,23.2156,72.6369,Gandhinagar City,23.2156,72.6369,2,Sector 7,23.2100,72.6300
+Bhavnagar,21.7645,72.1519,Bhavnagar City,21.7645,72.1519,1,Ghogha Circle,21.7700,72.1400
+Bhavnagar,21.7645,72.1519,Bhavnagar City,21.7645,72.1519,2,Kaliyabid,21.7500,72.1300
+Jamnagar,22.4707,70.0577,Jamnagar City,22.4707,70.0577,1,Pandit Nehru Marg,22.4700,70.0700
+Jamnagar,22.4707,70.0577,Jamnagar City,22.4707,70.0577,2,Digjam Circle,22.4600,70.0500

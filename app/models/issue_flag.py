@@ -18,7 +18,12 @@ class IssueFlag(Base):
     __tablename__ = "issue_flags"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    reporter_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    reporter_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
     # Either issue_id or comment_id is set (not both)
     issue_id = Column(

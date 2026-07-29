@@ -9,18 +9,19 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user, require_any_admin, require_role
+from app.core.deps import get_current_user, require_any_admin, require_role, user_scope_filter
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.issue import Issue
 from app.models.user import User
 from app.models.worker_complaint import WorkerComplaint
 from app.services.notification_service import notify_localized
-from app.services.storage import upload_image
+from app.core.exceptions import CivicException
+from app.services.storage import upload_image_or_raise
 
 logger = get_logger("complaints")
 
@@ -142,14 +143,16 @@ async def upload_complaint_photos(
             if len(file_bytes) > 10 * 1024 * 1024:
                 raise HTTPException(status_code=400, detail="File too large. Max 10 MB.")
             filename = f"complaint_{uuid.uuid4().hex[:8]}"
-            url = upload_image(file_bytes, filename, user_id=str(current_user.id))
-            if url:
-                uploaded_urls.append(url)
+            url = upload_image_or_raise(file_bytes, filename, user_id=str(current_user.id))
+            uploaded_urls.append(url)
 
         complaint.photos = (complaint.photos or []) + uploaded_urls
         db.commit()
         db.refresh(complaint)
-    except HTTPException:
+    except (HTTPException, CivicException):
+        # CivicException carries its own status (503 for a storage outage) and
+        # is rendered by the handler in main.py — do not flatten it to a 500.
+        db.rollback()
         raise
     except Exception as e:
         db.rollback()
@@ -193,7 +196,13 @@ def list_complaints(
 
     **Roles**: any admin.
     """
+    # Scoped by the complained-about worker's jurisdiction. This listed every
+    # worker complaint in the system to any admin role.
     query = db.query(WorkerComplaint)
+    scope = user_scope_filter(current_user)
+    if scope:
+        worker_ids = db.query(User.id).filter(*scope).scalar_subquery()
+        query = query.filter(WorkerComplaint.worker_id.in_(worker_ids))
     if status_filter:
         query = query.filter(WorkerComplaint.status == status_filter)
     if worker_id:
@@ -217,7 +226,12 @@ def resolve_complaint(
     if body.status not in allowed:
         raise HTTPException(status_code=400, detail=f"status must be one of: {', '.join(allowed)}")
 
-    complaint = db.query(WorkerComplaint).filter(WorkerComplaint.id == complaint_id).first()
+    complaint_q = db.query(WorkerComplaint).filter(WorkerComplaint.id == complaint_id)
+    scope = user_scope_filter(current_user)
+    if scope:
+        worker_ids = db.query(User.id).filter(*scope).scalar_subquery()
+        complaint_q = complaint_q.filter(WorkerComplaint.worker_id.in_(worker_ids))
+    complaint = complaint_q.first()
     if not complaint:
         raise HTTPException(status_code=404, detail="Complaint not found")
 

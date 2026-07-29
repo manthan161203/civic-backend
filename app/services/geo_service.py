@@ -42,6 +42,7 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
+from app.core.time import now_local
 from app.core.logger import get_logger
 
 logger = get_logger("geo")
@@ -133,8 +134,16 @@ def find_nearest_worker(
         normal = [w for w in all_candidates if task_counts.get(str(w.id), 0) < MAX_ACTIVE_TASKS]
         overloaded = [w for w in all_candidates if task_counts.get(str(w.id), 0) >= MAX_ACTIVE_TASKS]
 
-        # Separate candidates by shift compliance
-        now = datetime.utcnow()
+        # Separate candidates by shift compliance.
+        #
+        # Local time, not UTC. WorkerShift.start_time/end_time are String(5)
+        # wall-clock values an admin typed ("09:00"), which are local. Comparing
+        # them against a UTC "%H:%M" meant that at 10:00 IST the server computed
+        # "04:30" and every `"09:00" <= "04:30"` test failed — so every worker
+        # with a configured shift was classified out-of-shift for the entire
+        # working day and demoted below workers who had no shift at all. Shift
+        # routing did the exact opposite of what it advertises.
+        now = now_local()
         in_shift_normal, out_of_shift_normal = _split_by_shift(normal, now, db)
         in_shift_over, out_of_shift_over = _split_by_shift(overloaded, now, db)
 

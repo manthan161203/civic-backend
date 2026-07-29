@@ -107,12 +107,18 @@ def upgrade():
             
             # For FK drops/creates
             else:
-                # Try to drop existing
+                # The constraint may not exist yet, so the DROP is allowed to
+                # fail — but it has to fail inside a SAVEPOINT. In Postgres a
+                # failed statement aborts the entire transaction, and catching
+                # the Python exception does not roll it back; without the
+                # savepoint every following statement (including Alembic's own
+                # INSERT into alembic_version) dies with InFailedSqlTransaction.
                 try:
-                    conn.execute(sa.text(fix['sql_drop']))
-                except:
-                    pass  # Constraint might not exist yet
-                
+                    with conn.begin_nested():
+                        conn.execute(sa.text(fix['sql_drop']))
+                except Exception:
+                    pass
+
                 # Create new one
                 conn.execute(sa.text(fix['sql_create']))
                 print(f"✅ {fix['expected']}")

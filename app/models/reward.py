@@ -30,7 +30,7 @@ Points system:
 
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -53,6 +53,21 @@ class RewardTransaction(Base):
     note = Column(String(200), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
+    __table_args__ = (
+        # Backs the ON CONFLICT in rewards_service.award_event. Without a
+        # constraint the idempotency guard there was a bare SELECT-then-INSERT,
+        # so two concurrent requests both found nothing and both inserted — a
+        # double-tapped "resolve" paid twice and inflated the counts that unlock
+        # badges. Partial, because reference_id IS NULL means "this event is
+        # genuinely repeatable" and must not collide with itself.
+        Index(
+            "uq_reward_event_reference",
+            "user_id", "event_type", "reference_id",
+            unique=True,
+            postgresql_where=text("reference_id IS NOT NULL"),
+        ),
+    )
+
     user = relationship("User")
 
 
@@ -64,5 +79,13 @@ class UserBadge(Base):
                      nullable=False, index=True)
     badge_key = Column(String(50), nullable=False, index=True)  # e.g. "first_report"
     earned_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        # A user holds any given badge at most once. There was no constraint at
+        # all — only separate indexes on each column — so the check-then-insert
+        # in _check_badge_unlocks could duplicate under concurrency, giving a
+        # wrong badge_count on the leaderboard and two "Badge Unlocked" pushes.
+        UniqueConstraint("user_id", "badge_key", name="uq_user_badge"),
+    )
 
     user = relationship("User")

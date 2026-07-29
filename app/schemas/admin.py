@@ -13,7 +13,10 @@ from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
 
+from app.services.geofence_utils import MAX_GEOFENCE_RADIUS_KM
 from pydantic import BaseModel, Field, validator
+
+from app.schemas.auth import UserResponse
 
 
 class AssignWorker(BaseModel):
@@ -43,6 +46,35 @@ class CreateWorker(BaseModel):
     taluka_id: Optional[UUID] = Field(None, description="Taluka UUID (auto-set for ward_admin)")
     district_id: Optional[UUID] = Field(None, description="District UUID")
     department: Optional[str] = Field(None, description="water | roads | electricity | sanitation | parks | other")
+
+
+class WorkerInvitationResult(BaseModel):
+    """Response for ``POST /admin/workers`` and the resend endpoint.
+
+    Carries the worker profile plus the delivery outcome of the invitation.
+
+    The generated password is the only credential the worker has, and it is not
+    recoverable from the database (only its hash is stored). If the email did
+    not reach them, the calling admin is the last place it exists — so it is
+    returned here, to the authenticated admin who just created the account, over
+    the same TLS connection. It was previously written to the application log
+    instead, where it outlived the email by 30 days of log retention and was
+    shipped to Sentry as a breadcrumb.
+    """
+
+    user: UserResponse
+    invitation_email_sent: bool = Field(
+        ..., description="True if the invitation email was accepted by the SMTP server"
+    )
+    temp_password: Optional[str] = Field(
+        None,
+        description=(
+            "The worker's temporary password. Present only when the email was "
+            "not delivered (or EMAIL_BACKEND=console), in which case you must "
+            "relay it to the worker yourself. Null when the email was sent."
+        ),
+    )
+    message: str = Field(..., description="Human-readable delivery outcome")
 
 
 class UpdateWorker(BaseModel):
@@ -110,7 +142,7 @@ class CreateGeofenceRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, description="Zone name")
     latitude: float = Field(..., ge=-90, le=90, description="Latitude (-90 to 90)")
     longitude: float = Field(..., ge=-180, le=180, description="Longitude (-180 to 180)")
-    radius_km: float = Field(..., gt=0, le=100, description="Radius in km (0.1 km to 100 km, typically)")
+    radius_km: float = Field(..., gt=0, le=MAX_GEOFENCE_RADIUS_KM, description=f"Radius in km (0.1 to {MAX_GEOFENCE_RADIUS_KM:g})")
 
     @validator('name')
     def name_not_blank(cls, v):
@@ -123,8 +155,8 @@ class CreateGeofenceRequest(BaseModel):
         # Enforce practical limits (100m minimum, 100km maximum)
         if v < 0.1:
             raise ValueError('radius_km must be at least 0.1 km (100 meters)')
-        if v > 100:
-            raise ValueError('radius_km must not exceed 100 km')
+        if v > MAX_GEOFENCE_RADIUS_KM:
+            raise ValueError(f'radius_km must not exceed {MAX_GEOFENCE_RADIUS_KM:g} km')
         return v
 
 
@@ -137,7 +169,7 @@ class UpdateGeofenceRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255, description="Zone name")
     latitude: Optional[float] = Field(None, ge=-90, le=90, description="Latitude (-90 to 90)")
     longitude: Optional[float] = Field(None, ge=-180, le=180, description="Longitude (-180 to 180)")
-    radius_km: Optional[float] = Field(None, gt=0, le=100, description="Radius in km (0.1 to 100)")
+    radius_km: Optional[float] = Field(None, gt=0, le=MAX_GEOFENCE_RADIUS_KM, description=f"Radius in km (0.1 to {MAX_GEOFENCE_RADIUS_KM:g})")
 
     @validator('name')
     def name_not_blank(cls, v):
@@ -150,8 +182,8 @@ class UpdateGeofenceRequest(BaseModel):
         if v is not None:
             if v < 0.1:
                 raise ValueError('radius_km must be at least 0.1 km (100 meters)')
-            if v > 100:
-                raise ValueError('radius_km must not exceed 100 km')
+            if v > MAX_GEOFENCE_RADIUS_KM:
+                raise ValueError(f'radius_km must not exceed {MAX_GEOFENCE_RADIUS_KM:g} km')
         return v
 
 

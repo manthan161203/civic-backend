@@ -8,23 +8,18 @@ from alembic import context
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.core.config import settings
+from app.core.config import settings, validate_settings
 from app.database import Base
-from app.models import (
-    Announcement, CustomIssueType, Dispute, District, Issue, IssueBookmark,
-    IssueComment, IssueFlag, IssueVote, Notification, OTP, RefreshToken,
-    RewardTransaction, SatisfactionSurvey, Taluka, User, UserBadge, Ward,
-    WardSubscription, WorkerComplaint, WorkerShift,
-)
+# Importing the package registers every model with Base.metadata, which is what
+# autogenerate diffs against. Import the package rather than naming individual
+# models: an explicit list silently goes stale when a model is added, and a
+# model missing from Base.metadata makes autogenerate emit a DROP TABLE for it.
+import app.models  # noqa: F401
 
-_ = (
-    User, OTP, RefreshToken,
-    District, Taluka, Ward,
-    Issue, IssueComment, IssueVote, IssueFlag, IssueBookmark,
-    CustomIssueType, Dispute, SatisfactionSurvey, WorkerComplaint,
-    Notification, Announcement, WardSubscription, WorkerShift,
-    RewardTransaction, UserBadge,
-)  # register all tables with Base.metadata for autogenerate
+# Fail here rather than in the API container. runtime=False skips the checks a
+# migration cannot satisfy and does not need — it never sends an SMS or serves a
+# photo — while still enforcing secret strength and a valid database URL.
+validate_settings(runtime=False)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

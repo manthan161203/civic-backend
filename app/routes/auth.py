@@ -4,24 +4,24 @@ Authentication Routes
 Endpoints for phone OTP, Google OAuth, Aadhaar KYC, token management, and profile.
 
 All login/verify endpoints return ``TokenResponse`` (access_token + refresh_token + user).
-Access tokens expire in 15 minutes. Use ``POST /auth/refresh`` to rotate tokens.
+Access tokens expire per ``ACCESS_TOKEN_EXPIRE_MINUTES`` (default 60).
+Use ``POST /auth/refresh`` to rotate tokens.
 """
 
 from datetime import datetime, timedelta
 import re
-import secrets
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-
+from app.core.time import now_utc
 from app.core.config import settings
+from app.core.rate_limit import limiter
 from app.core.deps import get_current_user
 from app.core.logger import get_logger
 from app.core.security import create_access_token, hash_password, verify_password
 from app.database import get_db
+from app.models.location import Ward
 from app.models.otp import OTP
 from app.models.user import User
 from app.schemas.auth import (
@@ -37,7 +37,9 @@ from app.schemas.auth import (
     RefreshTokenRequest,
     RegisterRequest,
     ResetPasswordRequest,
+    AadharSendOTPResponse,
     SendOTPRequest,
+    SendOTPResponse,
     TokenResponse,
     UpdateProfileRequest,
     UserResponse,
@@ -51,11 +53,11 @@ from app.services.auth_service import (
     validate_refresh_token,
 )
 from app.services.sms_service import send_otp
-from app.services.storage import upload_image
+from app.core.exceptions import CivicException
+from app.services.storage import upload_image_or_raise
 
 logger = get_logger("auth")
 
-limiter = Limiter(key_func=get_remote_address)
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 OTP_EXPIRY_MINUTES = 10
@@ -65,7 +67,14 @@ OTP_COOLDOWN_SECONDS = 60
 # ── Phone OTP ─────────────────────────────────────────────────────────────────
 
 
-@router.post("/send-otp", status_code=status.HTTP_200_OK)
+@router.post(
+    "/send-otp",
+    response_model=SendOTPResponse,
+    # exclude_none: with the echo disabled the field is omitted entirely rather
+    # than serialised as null, so the response does not advertise it.
+    response_model_exclude_none=True,
+    status_code=status.HTTP_200_OK,
+)
 @limiter.limit("5/minute")
 async def send_otp_route(request: Request, body: SendOTPRequest, db: Session = Depends(get_db)):
     """Send a 6-digit OTP to the given phone number via SMS.
@@ -75,7 +84,8 @@ async def send_otp_route(request: Request, body: SendOTPRequest, db: Session = D
 
     Returns:
         ``{"message": "OTP sent successfully"}``
-        In DEV_MODE also returns ``{"dev_otp": "123456"}`` for testing.
+        With ``OTP_ECHO_IN_RESPONSE`` enabled (development only) also returns
+        ``{"dev_otp": "123456"}``.
 
     Raises:
         429: OTP requested too soon (wait 60 seconds).
@@ -86,7 +96,7 @@ async def send_otp_route(request: Request, body: SendOTPRequest, db: Session = D
             db.query(OTP)
             .filter(
                 OTP.phone == body.phone,
-                OTP.created_at > datetime.utcnow() - timedelta(seconds=OTP_COOLDOWN_SECONDS),
+                OTP.created_at > now_utc() - timedelta(seconds=OTP_COOLDOWN_SECONDS),
             )
             .first()
         )
@@ -101,7 +111,7 @@ async def send_otp_route(request: Request, body: SendOTPRequest, db: Session = D
         db.query(OTP).filter(
             OTP.phone == body.phone,
             OTP.is_used == False,
-            OTP.expires_at > datetime.utcnow(),
+            OTP.expires_at > now_utc(),
         ).update({"is_used": True})
         db.commit()
 
@@ -109,7 +119,7 @@ async def send_otp_route(request: Request, body: SendOTPRequest, db: Session = D
         otp = OTP(
             phone=body.phone,
             code=code,
-            expires_at=datetime.utcnow() + timedelta(minutes=OTP_EXPIRY_MINUTES),
+            expires_at=now_utc() + timedelta(minutes=OTP_EXPIRY_MINUTES),
         )
         db.add(otp)
         db.commit()
@@ -128,9 +138,9 @@ async def send_otp_route(request: Request, body: SendOTPRequest, db: Session = D
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Failed to send OTP via SMS. Please try again.")
 
     logger.info(f"OTP generated and sent for phone {body.phone}")
-    if settings.DEV_MODE:
-        return {"message": "OTP sent successfully", "dev_otp": code}
-    return {"message": "OTP sent successfully"}
+    if settings.OTP_ECHO_IN_RESPONSE:
+        return SendOTPResponse(message="OTP sent successfully", dev_otp=code)
+    return SendOTPResponse(message="OTP sent successfully")
 
 
 @router.post("/verify-otp", response_model=TokenResponse)
@@ -158,7 +168,7 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
                 OTP.phone == body.phone,
                 OTP.code == body.code,
                 OTP.is_used == False,
-                OTP.expires_at > datetime.utcnow(),
+                OTP.expires_at > now_utc(),
             )
             .first()
         )
@@ -169,8 +179,16 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
         # Check if existing user is active BEFORE consuming the OTP so it can be reused if forbidden
         existing_user = db.query(User).filter(User.phone == body.phone).first()
         if existing_user and not existing_user.is_active:
-            # Allow pending workers (role=worker, must_change_password=True) to log in and activate
-            if existing_user.role == "worker" and existing_user.must_change_password:
+            # Allow pending workers with an outstanding invitation to log in and
+            # activate. `invitation_sent_at` must be checked here too, not just
+            # in the activation branch below — otherwise a deactivated worker
+            # gets past this 403 and only fails to activate, which reads as a
+            # confusing partial success.
+            if (
+                existing_user.role == "worker"
+                and existing_user.must_change_password
+                and existing_user.invitation_sent_at is not None
+            ):
                 # Will activate below after OTP is verified
                 pass
             else:
@@ -188,8 +206,20 @@ def verify_otp_route(request: Request, body: VerifyOTPRequest, db: Session = Dep
             db.refresh(user)
             logger.info(f"New user account created for phone {body.phone} (user_id={user.id})")
         else:
-            # If pending worker logging in via OTP, activate them
-            if not user.is_active and user.role == "worker" and user.must_change_password:
+            # If pending worker logging in via OTP, activate them.
+            #
+            # `invitation_sent_at` is the thing that makes this safe. It is set
+            # when the invitation goes out, cleared on first password change, and
+            # cleared by an admin on deactivation — so it means "an invitation is
+            # still outstanding". Keying only on `must_change_password` (which
+            # deactivation used to leave set) meant a fired worker could log
+            # straight back in and flip their own account active again.
+            if (
+                not user.is_active
+                and user.role == "worker"
+                and user.must_change_password
+                and user.invitation_sent_at is not None
+            ):
                 user.is_active = True
                 db.commit()
                 logger.info(f"Activated pending worker {user.id} on first OTP login")
@@ -241,7 +271,10 @@ def google_login(request: Request, body: GoogleLoginRequest, db: Session = Depen
         google_info = verify_google_id_token(body.id_token)
     except ValueError as e:
         logger.warning(f"Google token verification failed: {e}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+        # Never str(e): provider errors carry token fragments, client IDs and
+        # request payload details. Log it, return a fixed message.
+        logger.warning(f"Google sign-in rejected: {e}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google sign-in failed. Please try again.")
 
     google_id = google_info["google_id"]
     email = google_info.get("email")
@@ -305,7 +338,12 @@ def google_login(request: Request, body: GoogleLoginRequest, db: Session = Depen
 # ── Aadhaar OTP ───────────────────────────────────────────────────────────────
 
 
-@router.post("/aadhar/send-otp", status_code=status.HTTP_200_OK)
+@router.post(
+    "/aadhar/send-otp",
+    response_model=AadharSendOTPResponse,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_200_OK,
+)
 @limiter.limit("5/minute")
 async def aadhar_send_otp(request: Request, body: AadharSendOTPRequest, db: Session = Depends(get_db)):
     """Request an OTP to the mobile number linked with the given Aadhaar number.
@@ -315,7 +353,8 @@ async def aadhar_send_otp(request: Request, body: AadharSendOTPRequest, db: Sess
 
     Returns:
         ``{"client_id": "...", "txn_id": "...", "message": "OTP sent ..."}``
-        In DEV_MODE also returns ``{"dev_otp": "123456"}``.
+        With ``OTP_ECHO_IN_RESPONSE`` enabled and ``AADHAAR_BACKEND=console``,
+        also returns ``{"dev_otp": "123456"}``.
 
     Raises:
         400: Invalid Aadhaar number format.
@@ -324,14 +363,16 @@ async def aadhar_send_otp(request: Request, body: AadharSendOTPRequest, db: Sess
     from app.services.aadhar_service import send_aadhar_otp, validate_aadhar_format
 
     if not validate_aadhar_format(body.aadhaar_number):
-        logger.warning(f"Invalid Aadhaar format submitted")
+        logger.warning("Invalid Aadhaar format submitted")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Aadhaar number format")
 
     try:
         result = await send_aadhar_otp(body.aadhaar_number, db)
     except RuntimeError as e:
         logger.error(f"Aadhaar OTP send failed: {e}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+        # See the note on the Google branch — no provider text to the client.
+        logger.warning(f"Aadhaar KYC provider error: {e}")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Aadhaar verification is temporarily unavailable. Please try again.")
     except Exception as e:
         logger.error(f"Unexpected error sending Aadhaar OTP: {e}", exc_info=True)
         raise HTTPException(
@@ -339,8 +380,15 @@ async def aadhar_send_otp(request: Request, body: AadharSendOTPRequest, db: Sess
             detail="Failed to send Aadhaar OTP. Please try again.",
         )
 
-    logger.info(f"Aadhaar OTP sent successfully")
-    return result
+    logger.info("Aadhaar OTP sent successfully")
+    # Build the response field by field rather than returning the provider dict:
+    # it is third-party data and must not be forwarded wholesale.
+    return AadharSendOTPResponse(
+        client_id=result.get("client_id", ""),
+        txn_id=result.get("txn_id"),
+        message=result.get("message", "OTP sent"),
+        dev_otp=result.get("dev_otp") if settings.OTP_ECHO_IN_RESPONSE else None,
+    )
 
 
 @router.post("/aadhar/verify", response_model=TokenResponse)
@@ -365,7 +413,9 @@ async def aadhar_verify_otp(request: Request, body: AadharVerifyRequest, db: Ses
         verified = await verify_aadhar_otp(body.aadhaar_number, body.otp, body.txn_id, db)
     except RuntimeError as e:
         logger.error(f"Aadhaar OTP verification provider error: {e}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+        # See the note on the Google branch — no provider text to the client.
+        logger.warning(f"Aadhaar KYC provider error: {e}")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Aadhaar verification is temporarily unavailable. Please try again.")
     except Exception as e:
         logger.error(f"Unexpected error verifying Aadhaar OTP: {e}", exc_info=True)
         raise HTTPException(
@@ -374,7 +424,7 @@ async def aadhar_verify_otp(request: Request, body: AadharVerifyRequest, db: Ses
         )
 
     if not verified:
-        logger.warning(f"Invalid or expired Aadhaar OTP")
+        logger.warning("Invalid or expired Aadhaar OTP")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired Aadhaar OTP")
 
     try:
@@ -406,7 +456,12 @@ async def aadhar_verify_otp(request: Request, body: AadharVerifyRequest, db: Ses
         if first_verification:
             try:
                 from app.services.rewards_service import award_event
-                award_event(db, user.id, "aadhar_verified", note="Aadhaar KYC completed")
+                # reference_id = the user, because Aadhaar verification is a
+                # once-per-lifetime event. With no reference_id the idempotency
+                # check was skipped and re-running the verify flow banked +50
+                # points every time.
+                award_event(db, user.id, "aadhar_verified", reference_id=user.id,
+                            note="Aadhaar KYC completed")
             except Exception:
                 pass
 
@@ -559,9 +614,14 @@ def login_with_password(request: Request, body: PasswordLoginRequest, db: Sessio
                 detail="Invalid credentials",
             )
 
-        # Check if user is deactivated (unless it's a pending worker)
+        # Check if user is deactivated (unless it's a pending worker).
+        # `invitation_sent_at` gates this — see the matching note in verify_otp.
         if not user.is_active:
-            if user.role == "worker" and user.must_change_password:
+            if (
+                user.role == "worker"
+                and user.must_change_password
+                and user.invitation_sent_at is not None
+            ):
                 # Pending worker — activate them on first login
                 user.is_active = True
                 db.commit()
@@ -626,7 +686,7 @@ async def forgot_password(request: Request, body: ForgotPasswordRequest, db: Ses
             otp = OTP(
                 phone=user.phone,
                 code=code,
-                expires_at=datetime.utcnow() + timedelta(minutes=10),
+                expires_at=now_utc() + timedelta(minutes=10),
             )
             db.add(otp)
             db.commit()
@@ -671,7 +731,7 @@ def reset_password(request: Request, body: ResetPasswordRequest, db: Session = D
                 OTP.phone == phone,
                 OTP.code == body.code,
                 OTP.is_used == False,
-                OTP.expires_at > datetime.utcnow(),
+                OTP.expires_at > now_utc(),
             )
             .first()
         )
@@ -696,10 +756,19 @@ def reset_password(request: Request, body: ResetPasswordRequest, db: Session = D
         user.must_change_password = False
         user.invitation_sent_at = None
         otp.is_used = True
+
+        # Kill every existing session. A password reset is the account-recovery
+        # path — the user is very likely here *because* someone else has their
+        # credentials. Previously this wrote the new hash and nothing else, so an
+        # attacker's stolen refresh token kept rotating indefinitely and their
+        # access token kept working: the recovery flow recovered nothing.
+        revoke_all_user_tokens(str(user.id), db)
+        user.tokens_valid_from = now_utc()
         db.commit()
         db.refresh(user)
 
-        # Issue tokens (auto-login)
+        # Issue tokens (auto-login). Minted after the cutoff above, so these are
+        # the only credentials that survive.
         access_token = create_access_token({"sub": str(user.id)})
         refresh_token = create_refresh_token(str(user.id), db)
 
@@ -757,10 +826,19 @@ def change_password(
         current_user.password_hash = hash_password(body.new_password)
         current_user.must_change_password = False
         current_user.invitation_sent_at = None
+
+        # Changing a password ends every other session — same reasoning as the
+        # reset path. The caller's current tokens are retired too, which is
+        # deliberate: the client re-authenticates with the new password.
+        revoke_all_user_tokens(str(current_user.id), db)
+        current_user.tokens_valid_from = now_utc()
         db.commit()
 
-        logger.info(f"User {current_user.id} changed password")
-        return {"message": "Password changed successfully"}
+        logger.info(f"User {current_user.id} changed password; all sessions revoked")
+        return {
+            "message": "Password changed successfully. Please sign in again.",
+            "sessions_revoked": True,
+        }
 
     except HTTPException:
         raise
@@ -917,12 +995,25 @@ def update_profile(
             current_user.name = body.name
         if body.ward is not None:
             current_user.ward = body.ward
+        # `ward_id` is a citizen's home ward — a display/subscription preference.
+        # For every other role it is the column `get_admin_scope_filter` derives
+        # authority from, so letting a user write it here was straight privilege
+        # escalation: a ward_admin could PUT their own ward_id and take over any
+        # other ward's issues, workers and citizens. `taluka_id`/`district_id`
+        # are no longer accepted from any caller at all; admin scope is assigned
+        # exclusively through POST/PUT /admin/admins.
         if body.ward_id is not None:
+            if current_user.role != "citizen":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Your jurisdiction is assigned by an administrator and cannot be changed here",
+                )
+            if not db.query(Ward.id).filter(Ward.id == body.ward_id).first():
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Ward not found",
+                )
             current_user.ward_id = body.ward_id
-        if body.taluka_id is not None:
-            current_user.taluka_id = body.taluka_id
-        if body.district_id is not None:
-            current_user.district_id = body.district_id
         if body.language is not None:
             current_user.language = body.language
         if body.fcm_token is not None:
@@ -1007,7 +1098,7 @@ def delete_account(
         from app.models.ward_subscription import WardSubscription
         from app.models.worker_complaint import WorkerComplaint
         from app.models.worker_shift import WorkerShift
-        from app.models.reward import Reward
+        from app.models.reward import RewardTransaction, UserBadge
         
         user_id = current_user.id
         
@@ -1035,13 +1126,13 @@ def delete_account(
         
         # 5. Clean up issue flags (reported issues)
         flag_count = db.query(IssueFlag).filter(
-            IssueFlag.flagger_id == user_id
+            IssueFlag.reporter_id == user_id
         ).delete()
         logger.info(f"Deleted {flag_count} issue flags for user {user_id}")
         
         # 6. Clean up ward subscriptions (for citizens)
         sub_count = db.query(WardSubscription).filter(
-            WardSubscription.citizen_id == user_id
+            WardSubscription.user_id == user_id
         ).delete()
         logger.info(f"Deleted {sub_count} ward subscriptions for user {user_id}")
         
@@ -1057,11 +1148,22 @@ def delete_account(
         ).delete()
         logger.info(f"Deleted {shift_count} worker shifts for user {user_id}")
         
-        # 9. Clean up reward records
-        reward_count = db.query(Reward).filter(
-            Reward.user_id == user_id
+        # 9. Clean up reward records.
+        #
+        # Two tables, not one. This referenced a `Reward` model that has never
+        # existed — the ImportError was raised before *any* cleanup ran, caught
+        # by the blanket handler below, and returned as a generic 500. Account
+        # deletion has therefore never worked once, for any user, which for a
+        # DPDP/GDPR erasure right is not a cosmetic bug.
+        reward_count = db.query(RewardTransaction).filter(
+            RewardTransaction.user_id == user_id
         ).delete()
-        logger.info(f"Deleted {reward_count} reward records for user {user_id}")
+        badge_count = db.query(UserBadge).filter(
+            UserBadge.user_id == user_id
+        ).delete()
+        logger.info(
+            f"Deleted {reward_count} reward transaction(s) and {badge_count} badge(s) for user {user_id}"
+        )
         
         # 10. Unassign any unstarted tasks (status='assigned' or 'in_progress')
         # These will be reassigned to 'open' so other workers can pick them up
@@ -1074,8 +1176,13 @@ def delete_account(
             issue.status = "open"
         logger.info(f"Unassigned {len(pending_issues)} pending tasks for worker {user_id}")
         
-        # 11. Mark account as inactive
+        # 11. Mark account as inactive and retire live access tokens.
+        # revoke_all_user_tokens above only reaches refresh tokens; access
+        # tokens are stateless and would otherwise keep working until expiry.
         current_user.is_active = False
+        current_user.must_change_password = False
+        current_user.invitation_sent_at = None
+        current_user.tokens_valid_from = now_utc()
         db.commit()
         
         logger.info(
@@ -1091,6 +1198,7 @@ def delete_account(
                 "complaints_deleted": complaint_count,
                 "shifts_deleted": shift_count,
                 "rewards_deleted": reward_count,
+                "badges_deleted": badge_count,
                 "pending_issues_unassigned": len(pending_issues)
             }
         )
@@ -1154,13 +1262,14 @@ def upload_profile_photo(
         )
 
     try:
-        # Upload to storage service
-        photo_url = upload_image(
+        # Raises rather than returning None, which would have overwritten the
+        # user's existing profile photo with null on a storage failure.
+        photo_url = upload_image_or_raise(
             file_bytes=file_content,
             filename=file.filename,
             user_id=str(current_user.id)
         )
-        
+
         # Update user's profile photo
         current_user.profile_photo_url = photo_url
         db.commit()
@@ -1168,6 +1277,11 @@ def upload_profile_photo(
         
         logger.info(f"Profile photo uploaded for user {current_user.id}: {photo_url}")
         return UserResponse.model_validate(current_user)
+    except CivicException:
+        # Carries its own status (503 when storage is down); rendered by the
+        # handler in main.py rather than flattened to a 500 here.
+        db.rollback()
+        raise
     except Exception as e:
         logger.error(f"Error uploading profile photo for user {current_user.id}: {e}", exc_info=True)
         raise HTTPException(
@@ -1180,7 +1294,9 @@ def upload_profile_photo(
 
 
 @router.post("/phone/change/send-otp", status_code=status.HTTP_200_OK)
+@limiter.limit("3/minute")
 async def phone_change_send_otp(
+    request: Request,
     body: ChangePhoneSendOTPRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1223,7 +1339,7 @@ async def phone_change_send_otp(
             )
 
     code = generate_otp()
-    expiry = datetime.utcnow() + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    expiry = now_utc() + timedelta(minutes=OTP_EXPIRY_MINUTES)
     otp = OTP(phone=body.new_phone, code=code, expires_at=expiry)
     db.add(otp)
     db.commit()
@@ -1345,7 +1461,7 @@ def export_my_data(
 
     logger.info(f"Data export requested by user {current_user.id}")
     return {
-        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "exported_at": now_utc().isoformat() + "Z",
         "profile": {
             "id": str(current_user.id),
             "phone": current_user.phone,

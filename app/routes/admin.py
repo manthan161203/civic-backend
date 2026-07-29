@@ -19,8 +19,9 @@ Frontend Integration Notes:
 - Heatmap data returns lat/lng/weight for map visualization libraries.
 """
 
-import uuid
 import re
+import secrets
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
@@ -29,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 
+from app.core.time import now_utc
 from app.services.geofence_utils import (
     check_geofences_intersect,
     validate_geofence_radius,
@@ -36,34 +38,32 @@ from app.services.geofence_utils import (
 )
 from sqlalchemy.orm import Session
 
-from app.core.deps import apply_admin_scope, require_any_admin, require_role
+from app.core.deps import apply_admin_scope, require_any_admin, require_role, user_scope_filter
 from app.core.logger import get_logger
 from app.core.security import hash_password
+from app.services.email_service import send_worker_invitation
 from app.database import get_db
 from app.models.announcement import Announcement
 from app.models.geofence import Geofence
 from app.models.issue import Issue
 from app.models.issue_flag import IssueFlag
+from app.models.location import Taluka, Ward
 from app.models.user import User
-from app.services.admin_messaging import AdminMessage
+from app.core.config import settings
 from app.schemas.admin import (
-    AssignWorker, CreateWorker, CreateGeofenceRequest, DashboardStats, 
-    GeofenceListResponse, GeofenceResponse, UpdateWorker, UpdateSubAdmin, UpdateGeofenceRequest
+    AssignWorker, CreateWorker, CreateGeofenceRequest, DashboardStats,
+    GeofenceListResponse, GeofenceResponse, UpdateWorker, UpdateSubAdmin,
+    UpdateGeofenceRequest, WorkerInvitationResult
 )
 from app.schemas.auth import UserResponse
 from app.schemas.issue import IssueListResponse, IssueResponse
 from app.services.utils import (
     apply_not_deleted_filter,
     apply_active_filter,
-    get_users_by_role,
-    count_issues_by_status,
 )
 from app.services.auth_service import revoke_all_user_tokens
 from app.services.admin_override import (
     log_override_access,
-    get_active_overrides,
-    revoke_override,
-    get_override_log,
 )
 from app.core.exceptions import ResourceNotFoundError, ValidationError, ProcessingError
 
@@ -220,7 +220,7 @@ def reassign_worker(
     
     # STEP 6: Verify worker is in JURISDICTION (admin's scope)
     # FIX: Properly validate scope filters - was using zip(scope, scope) which always evaluates to true
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         # Create a test query with worker and scope filters to validate jurisdiction
         test_query = db.query(User).filter(User.id == worker.id, *scope).first()
@@ -296,7 +296,7 @@ def unblock_task(
     
     try:
         issue.is_blocked = False
-        issue.unblocked_at = datetime.utcnow()
+        issue.unblocked_at = now_utc()
         issue.unblocked_by_id = current_user.id
         issue.admin_unblock_note = admin_notes
         issue.block_resolved_by = "unblock"
@@ -490,7 +490,7 @@ def bulk_unblock_tasks(
             
             # Unblock the task
             issue.is_blocked = False
-            issue.unblocked_at = datetime.utcnow()
+            issue.unblocked_at = now_utc()
             issue.unblocked_by_id = current_user.id
             issue.admin_unblock_note = admin_notes
             issue.block_resolved_by = "bulk_unblock"
@@ -575,7 +575,7 @@ def assign_worker(
             query = query.filter(User.ward_id.in_(taluka_wards))
     
     # Apply jurisdiction scope filters (additional safety check)
-    scope_filters = _user_scope_filter(current_user)
+    scope_filters = user_scope_filter(current_user)
     if scope_filters:
         query = query.filter(*scope_filters)
     
@@ -649,7 +649,7 @@ def escalate_issue(
 
     try:
         issue.is_escalated = True
-        issue.escalated_at = datetime.utcnow()
+        issue.escalated_at = now_utc()
         db.commit()
         db.refresh(issue)
     except Exception as e:
@@ -720,7 +720,7 @@ def bulk_issue_action(
                 processed += 1
             elif body.action == "escalate" and not issue.is_escalated:
                 issue.is_escalated = True
-                issue.escalated_at = datetime.utcnow()
+                issue.escalated_at = now_utc()
                 processed += 1
             elif body.action == "assign" and worker:
                 issue.assigned_worker_id = worker.id
@@ -789,11 +789,28 @@ def auto_assign_open_issues(
         )
         total_open = apply_not_deleted_filter(total_open).scalar() or 0
 
-        assigned_count = 0
+        # Assign everything first, then commit once, then notify.
+        #
+        # This was one COMMIT per issue plus one notify (another commit, plus a
+        # blocking FCM round-trip) inside the loop — up to 400 commits and 200
+        # push calls in a single HTTP request at limit=200. Worse, the handler
+        # below raised 500 with no rollback, so a failure at issue 137 left 136
+        # issues assigned while telling the admin the operation had failed.
+        assigned = []
         skipped_count = 0
         for issue in open_issues:
             if auto_assign(issue, db):
-                db.commit()
+                assigned.append(issue)
+            else:
+                skipped_count += 1
+
+        db.commit()
+        assigned_count = len(assigned)
+
+        # Notifications are best-effort and come after the state is durable, so
+        # a push failure cannot undo the assignments.
+        for issue in assigned:
+            try:
                 db.refresh(issue)
                 if issue.assigned_worker:
                     notify_localized(
@@ -805,10 +822,10 @@ def auto_assign_open_issues(
                         issue_type=issue.issue_type,
                         ward=issue.ward or "your area",
                     )
-                assigned_count += 1
-            else:
-                skipped_count += 1
+            except Exception as e:
+                logger.warning("Assignment notification failed for issue %s: %s", issue.id, e)
     except Exception as e:
+        db.rollback()
         logger.error(f"Auto-assign open issues error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Auto-assignment failed.")
 
@@ -863,8 +880,16 @@ def delete_user(
             from app.core.exceptions import AuthorizationError
             raise AuthorizationError("delete", "higher-rank admin")
         
-        # Check user is in their district
-        if user.district_id and user.district_id != current_user.district_id:
+        # Check user is in their district.
+        #
+        # The `user.district_id and ...` guard these three checks used to carry
+        # short-circuited to False whenever the column was NULL — and NULL is the
+        # default for every account created through register, verify-otp, Google
+        # or Aadhaar. So the jurisdiction check silently passed for essentially
+        # all citizens, letting a ward_admin in one village deactivate any
+        # citizen in the state. A user with no scope belongs to no jurisdiction,
+        # so no scoped admin owns them: only the super-admin may delete them.
+        if user.district_id != current_user.district_id:
             from app.core.exceptions import AuthorizationError
             raise AuthorizationError("delete", "user outside your jurisdiction")
     elif current_user.role == "taluka_admin":
@@ -872,9 +897,9 @@ def delete_user(
         if user.role in ["admin", "district_admin", "taluka_admin"]:
             from app.core.exceptions import AuthorizationError
             raise AuthorizationError("delete", "higher-rank admin")
-        
-        # Check user is in their taluka
-        if user.taluka_id and user.taluka_id != current_user.taluka_id:
+
+        # Check user is in their taluka (see the NULL-scope note above)
+        if user.taluka_id != current_user.taluka_id:
             from app.core.exceptions import AuthorizationError
             raise AuthorizationError("delete", "user outside your jurisdiction")
     elif current_user.role == "ward_admin":
@@ -882,8 +907,9 @@ def delete_user(
         if user.role != "worker":
             from app.core.exceptions import AuthorizationError
             raise AuthorizationError("delete", "non-worker user")
-        
-        if user.ward_id and user.ward_id != current_user.ward_id:
+
+        # (see the NULL-scope note above)
+        if user.ward_id != current_user.ward_id:
             from app.core.exceptions import AuthorizationError
             raise AuthorizationError("delete", "worker outside your ward")
     
@@ -891,18 +917,24 @@ def delete_user(
     try:
         # Log the deletion action for audit purposes
         logger.warning(
-            f"Admin deleted user account",
+            "Admin deleted user account",
             extra={
                 "deleting_admin_id": str(current_user.id),
                 "deleting_admin_role": current_user.role,
                 "deleted_user_id": str(user_id),
                 "deleted_user_role": user.role,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": now_utc().isoformat()
             }
         )
         
         # Mark as inactive and revoke tokens
         user.is_active = False
+        # Clear any outstanding invitation so the account cannot reactivate
+        # itself through the pending-worker branch in login/verify-otp, and
+        # retire stateless access tokens that revocation does not reach.
+        user.must_change_password = False
+        user.invitation_sent_at = None
+        user.tokens_valid_from = now_utc()
         revoke_all_user_tokens(str(user_id), db)
         
         # If worker, unassign pending tasks
@@ -928,7 +960,8 @@ def delete_user(
     except Exception as e:
         db.rollback()
         logger.error(f"Error deleting user {user_id}: {e}", exc_info=True)
-        raise ProcessingError(f"Failed to delete user: {str(e)}")
+        # Raw DB exception text was being forwarded to the client here.
+        raise ProcessingError("user_deletion", "Failed to delete user. Please try again.")
 
 
 @router.delete("/issues/{issue_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -951,7 +984,7 @@ def delete_issue(
         raise HTTPException(status_code=400, detail="Issue is already deleted")
     try:
         issue.is_deleted = True
-        issue.deleted_at = datetime.utcnow()
+        issue.deleted_at = now_utc()
         db.commit()
     except Exception as e:
         logger.error(f"Error soft-deleting issue {issue_id}: {e}", exc_info=True)
@@ -976,7 +1009,7 @@ def export_issues(
     from fastapi.responses import StreamingResponse
 
     try:
-        since = datetime.utcnow() - timedelta(days=days)
+        since = now_utc() - timedelta(days=days)
         query = (
             apply_admin_scope(db.query(Issue), current_user, Issue)
             .filter(Issue.created_at >= since)
@@ -1125,14 +1158,19 @@ def list_workers(
       - is_active: true/false to list active or invited/inactive workers.
     """
     try:
-        query_results = get_users_by_role("worker", db) if is_active is None else get_users_by_role("worker", db, active_only=False)
-        query = db.query(User).filter(User.id.in_([u.id for u in query_results]))
+        # Filter on the role directly. This used to call get_users_by_role(),
+        # which ends in .all(), pull every worker row into Python, and send the
+        # UUIDs straight back to Postgres as an IN list — which also blows past
+        # the bind-parameter limit once the worker table is large.
+        query = db.query(User).filter(User.role == "worker")
+        if is_active is None:
+            query = query.filter(User.is_active == True)  # noqa: E712
 
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
 
         # Scope by location FK when available
-        scope = _user_scope_filter(current_user)
+        scope = user_scope_filter(current_user)
         if scope:
             query = query.filter(*scope)
 
@@ -1158,7 +1196,62 @@ def list_workers(
     }
 
 
-@router.post("/workers", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def _try_send_invitation(*, to_email: str, worker_name: str, phone: str, temp_password: str) -> bool:
+    """Send the invitation, converting any failure into a False return.
+
+    The password hash is committed before this runs, so an exception escaping
+    here would leave the worker holding a credential that no longer exists
+    anywhere in readable form. Delivery is allowed to fail; losing the password
+    is not.
+    """
+    try:
+        return await send_worker_invitation(
+            to_email=to_email,
+            worker_name=worker_name,
+            phone=phone,
+            temp_password=temp_password,
+        )
+    except Exception as e:
+        logger.error("Invitation email raised %s: %s", type(e).__name__, e, exc_info=True)
+        return False
+
+
+def _invitation_result(worker: User, temp_password: str, email_sent: bool) -> WorkerInvitationResult:
+    """Build the invitation response, disclosing the password only when needed.
+
+    Only the hash is stored, so if the worker did not receive the email this is
+    the last place the password exists. The console email backend counts as "not
+    delivered" — it logs a redacted message and sends nothing.
+    """
+    delivered = email_sent and settings.EMAIL_BACKEND != "console"
+    if delivered:
+        message = f"Invitation email sent to {worker.email}."
+    elif settings.EMAIL_BACKEND == "console":
+        message = (
+            "EMAIL_BACKEND is 'console', so no email was sent. "
+            "Give the temporary password below to the worker."
+        )
+    else:
+        message = (
+            "The invitation email could not be delivered. Give the temporary "
+            "password below to the worker, or call the resend endpoint once "
+            "email is working again."
+        )
+        logger.error(
+            "Invitation email delivery failed for worker %s (%s)",
+            worker.id,
+            worker.email,
+        )
+
+    return WorkerInvitationResult(
+        user=UserResponse.model_validate(worker),
+        invitation_email_sent=delivered,
+        temp_password=None if delivered else temp_password,
+        message=message,
+    )
+
+
+@router.post("/workers", response_model=WorkerInvitationResult, status_code=status.HTTP_201_CREATED)
 async def create_worker(
     body: CreateWorker,
     current_user: User = Depends(require_any_admin),
@@ -1175,8 +1268,6 @@ async def create_worker(
 
     **Roles**: any admin.
     """
-    from app.services.email_service import send_worker_invitation
-    import secrets
 
     try:
         # Check phone uniqueness
@@ -1233,26 +1324,21 @@ async def create_worker(
             password_hash=hash_password(temp_password),
             is_active=False,  # Pending until first login
             must_change_password=True,
-            invitation_sent_at=datetime.utcnow(),
+            invitation_sent_at=now_utc(),
         )
         db.add(worker)
         db.commit()
         db.refresh(worker)
 
-        # Send invitation email (best-effort — don't fail if email fails)
-        email_sent = await send_worker_invitation(
+        # Best-effort email: the account is already committed, so a delivery
+        # failure must not lose the credential. The password is returned to the
+        # calling admin instead of being logged — see WorkerInvitationResult.
+        email_sent = await _try_send_invitation(
             to_email=body.email,
             worker_name=body.name or "",
             phone=body.phone,
             temp_password=temp_password,
         )
-
-        if not email_sent:
-            # Log warning with temp password visible in DEV_MODE for recovery
-            logger.warning(
-                f"Failed to send invitation email to {body.email} for worker {worker.id}. "
-                f"Temp password (for admin recovery): {temp_password}"
-            )
 
     except HTTPException:
         raise
@@ -1261,7 +1347,70 @@ async def create_worker(
         raise HTTPException(status_code=500, detail="Failed to create worker account.")
 
     logger.info(f"Admin {current_user.id} created worker {worker.id} ({body.phone})")
-    return UserResponse.model_validate(worker)
+    return _invitation_result(worker, temp_password, email_sent)
+
+
+@router.post("/workers/{worker_id}/resend-invitation", response_model=WorkerInvitationResult)
+async def resend_worker_invitation(
+    worker_id: uuid.UUID,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Issue a fresh temporary password for a worker and re-send the invitation.
+
+    The recovery path for a worker whose invitation email never arrived. Without
+    it, a failed delivery left the account permanently unusable: the password is
+    stored only as a hash, and the account is deactivated after 7 days of
+    inactivity by the escalation job.
+
+    Rotates the password, so any previously issued one stops working. Only
+    applies to workers who have not yet completed their first login.
+
+    **Roles**: any admin (scoped).
+
+    Raises:
+        404: Worker not found, or outside your jurisdiction.
+        409: Worker has already set their own password.
+    """
+    query = db.query(User).filter(User.id == worker_id, User.role == "worker")
+    scope = user_scope_filter(current_user)
+    if scope:
+        query = query.filter(*scope)
+    worker = query.first()
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    if not worker.must_change_password:
+        raise HTTPException(
+            status_code=409,
+            detail="This worker has already set their own password; use password reset instead.",
+        )
+
+    if not worker.email:
+        raise HTTPException(status_code=409, detail="This worker has no email address on file.")
+
+    try:
+        temp_password = secrets.token_urlsafe(12)
+        worker.password_hash = hash_password(temp_password)
+        worker.invitation_sent_at = now_utc()
+        db.commit()
+        db.refresh(worker)
+
+        email_sent = await _try_send_invitation(
+            to_email=worker.email,
+            worker_name=worker.name or "",
+            phone=worker.phone,
+            temp_password=temp_password,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error resending invitation for worker {worker_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to resend invitation.")
+
+    logger.info(f"Admin {current_user.id} resent invitation for worker {worker.id}")
+    return _invitation_result(worker, temp_password, email_sent)
 
 
 @router.put("/workers/{worker_id}", response_model=UserResponse)
@@ -1273,7 +1422,7 @@ def update_worker(
 ):
     """Update a worker's profile. **Roles**: any admin (scoped)."""
     query = db.query(User).filter(User.id == worker_id, User.role == "worker")
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         query = query.filter(*scope)
     worker = query.first()
@@ -1333,9 +1482,19 @@ def deactivate_worker(
         worker.is_active = False
         worker.is_online = False
         worker.is_available = False
+        # Retire the outstanding invitation, if any. The login and verify-otp
+        # paths reactivate a pending worker who still has one, so leaving these
+        # set let a deactivated worker sign in and undo this.
+        worker.must_change_password = False
+        worker.invitation_sent_at = None
+        # And retire their live access tokens, which are stateless and would
+        # otherwise keep working until they expired.
+        worker.tokens_valid_from = now_utc()
+        revoke_all_user_tokens(str(worker_id), db)
         db.commit()
         db.refresh(worker)
     except Exception as e:
+        db.rollback()
         logger.error(f"Error deactivating worker {worker_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to deactivate worker.")
     logger.info(f"Admin {current_user.id} deactivated worker {worker_id}")
@@ -1369,9 +1528,9 @@ def worker_leaderboard(
 ):
     """Top workers ranked by performance score. **Roles**: any admin."""
     try:
-        query_results = get_users_by_role("worker", db)
-        query = db.query(User).filter(User.id.in_([u.id for u in query_results]))
-        scope = _user_scope_filter(current_user)
+        # See the note in list_workers — direct role filter, no round-trip.
+        query = db.query(User).filter(User.role == "worker", User.is_active == True)  # noqa: E712
+        scope = user_scope_filter(current_user)
         if scope:
             query = query.filter(*scope)
         workers = query.all()
@@ -1456,9 +1615,9 @@ def get_all_worker_locations(
 ):
     """Live locations of all workers for the admin map. **Roles**: any admin."""
     try:
-        query_results = get_users_by_role("worker", db)
-        query = db.query(User).filter(User.id.in_([u.id for u in query_results]))
-        scope = _user_scope_filter(current_user)
+        # See the note in list_workers — direct role filter, no round-trip.
+        query = db.query(User).filter(User.role == "worker", User.is_active == True)  # noqa: E712
+        scope = user_scope_filter(current_user)
         if scope:
             query = query.filter(*scope)
         if online_only:
@@ -1549,7 +1708,7 @@ def get_worker_performance_report(
     """
     from sqlalchemy import extract
     worker = _get_scoped_worker(worker_id, current_user, db)
-    since = datetime.utcnow() - timedelta(days=days)
+    since = now_utc() - timedelta(days=days)
 
     try:
         base = db.query(Issue).filter(
@@ -1644,7 +1803,7 @@ def list_citizens(
     """List citizens in the admin's scope (paginated). **Roles**: any admin."""
     try:
         query = db.query(User).filter(User.role == "citizen")
-        scope = _user_scope_filter(current_user)
+        scope = user_scope_filter(current_user)
         if scope:
             query = query.filter(*scope)
         if ward:
@@ -1697,7 +1856,7 @@ def get_citizen(
 ):
     """Get citizen profile with issue statistics. **Roles**: any admin (scoped)."""
     query = db.query(User).filter(User.id == citizen_id, User.role == "citizen")
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         query = query.filter(*scope)
     citizen = query.first()
@@ -1737,7 +1896,7 @@ def deactivate_citizen(
 ):
     """Deactivate a citizen account. **Roles**: any admin."""
     query = db.query(User).filter(User.id == citizen_id, User.role == "citizen")
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         query = query.filter(*scope)
     citizen = query.first()
@@ -1761,7 +1920,7 @@ def reactivate_citizen(
 ):
     """Reactivate a citizen account. **Roles**: any admin."""
     query = db.query(User).filter(User.id == citizen_id, User.role == "citizen")
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         query = query.filter(*scope)
     citizen = query.first()
@@ -1871,7 +2030,7 @@ def list_sub_admins(
     """List sub-admins in the current admin's scope. **Roles**: admin, district_admin, taluka_admin."""
     from app.core.deps import ADMIN_ROLES
     query = db.query(User).filter(User.role.in_(list(ADMIN_ROLES - {"admin"})))
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         query = query.filter(*scope)
     if role:
@@ -1896,8 +2055,18 @@ def update_admin(
     if not admin:
         raise HTTPException(status_code=404, detail="Admin not found")
 
+    # No self-editing. A sub-admin satisfies their own scope filter and holds a
+    # role in the allowed list, so without this a taluka_admin could target their
+    # own id and rewrite their jurisdiction — the scope check below would pass,
+    # because it is checking them against themselves.
+    if admin.id == current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot edit your own admin record. Ask a higher-level admin.",
+        )
+
     # Check if current user has permission to edit this admin
-    scope = _user_scope_filter(current_user)
+    scope = user_scope_filter(current_user)
     if scope:
         # Apply scope filter to check permission
         user_query = db.query(User).filter(User.id == admin_id)
@@ -1933,13 +2102,24 @@ def update_admin(
                 admin.phone = body.phone
         if body.role is not None:
             admin.role = body.role
+
+        # The new scope must sit inside the caller's own. Checked before any of
+        # the three columns is written, so a request naming a valid ward and an
+        # out-of-jurisdiction district cannot land half-applied.
+        _assert_scope_within_caller(
+            current_user,
+            ward_id=body.ward_id,
+            taluka_id=body.taluka_id,
+            district_id=body.district_id,
+            db=db,
+        )
         if body.ward_id is not None:
             admin.ward_id = body.ward_id
         if body.taluka_id is not None:
             admin.taluka_id = body.taluka_id
         if body.district_id is not None:
             admin.district_id = body.district_id
-        
+
         db.commit()
         db.refresh(admin)
     except HTTPException:
@@ -2031,7 +2211,7 @@ def grant_override_access(
         # Calculate override expiry time
         override_until = None
         if body.duration_minutes:
-            override_until = datetime.utcnow() + timedelta(minutes=body.duration_minutes)
+            override_until = now_utc() + timedelta(minutes=body.duration_minutes)
         
         # Create the AdminOverride entry
         override = AdminOverride(
@@ -2097,7 +2277,7 @@ def list_active_overrides(
         query = db.query(AdminOverride).filter(
             AdminOverride.revoked_at.is_(None),  # Not revoked
             (AdminOverride.override_until.is_(None)) |  # Permanent or
-            (AdminOverride.override_until > datetime.utcnow())  # Not expired
+            (AdminOverride.override_until > now_utc())  # Not expired
         )
         
         if admin_id:
@@ -2157,7 +2337,7 @@ def revoke_admin_override(
             raise HTTPException(status_code=400, detail="Override is already revoked")
         
         # Update revocation fields
-        override.revoked_at = datetime.utcnow()
+        override.revoked_at = now_utc()
         override.revoked_by = current_user.id
         db.commit()
         db.refresh(override)
@@ -2224,7 +2404,7 @@ def get_override_audit_log(
                     "reason": o.reason,
                     "created_at": o.created_at.isoformat(),
                     "expires_at": o.override_until.isoformat() if o.override_until else None,
-                    "is_active": o.override_until is None or o.override_until > datetime.utcnow()
+                    "is_active": o.override_until is None or o.override_until > now_utc()
                 }
                 for o in logs
             ]
@@ -2313,13 +2493,16 @@ def get_inbox_messages(
     **Roles**: any admin.
     """
     try:
-        from app.services.admin_messaging import get_inbox
-        
-        all_messages = get_inbox(current_user.id, unread_only=unread_only, db=db)
-        total = len(all_messages)
-        
-        # Apply pagination
-        messages = all_messages[(page - 1) * size : page * size]
+        from app.services.admin_messaging import count_inbox, get_inbox
+
+        # Count and page in SQL. This used to fetch every message the admin had
+        # ever received and slice the list in Python — then touch m.sender.name
+        # on each row, one query per message.
+        total = count_inbox(current_user.id, db, unread_only=unread_only)
+        messages = get_inbox(
+            current_user.id, unread_only=unread_only, db=db,
+            limit=size, offset=(page - 1) * size,
+        )
         
         return {
             "status": "success",
@@ -2385,13 +2568,13 @@ def get_sent_messages(
     **Roles**: any admin.
     """
     try:
-        from app.services.admin_messaging import get_sent_messages
-        
-        all_messages = get_sent_messages(current_user.id, db=db)
-        total = len(all_messages)
-        
-        # Apply pagination
-        messages = all_messages[(page - 1) * size : page * size]
+        from app.services.admin_messaging import count_sent, get_sent_messages
+
+        # Count and page in SQL — see the note in get_inbox.
+        total = count_sent(current_user.id, db)
+        messages = get_sent_messages(
+            current_user.id, db=db, limit=size, offset=(page - 1) * size
+        )
         
         return {
             "status": "success",
@@ -2447,7 +2630,7 @@ def get_message(
 
         if message.receiver_id == current_user.id and not message.is_read:
             mark_read(message_id, db)
-            message.is_read = datetime.utcnow()
+            message.is_read = now_utc()
 
         return {
             "status": "success",
@@ -2509,7 +2692,10 @@ def create_announcement(
     - ``district`` → all citizens in a district
     - ``state``    → everyone (super-admin only)
 
-    After creation, sends push notifications to all matching citizens with FCM tokens.
+    Push notifications are queued, not sent inline: the `jobs` service picks
+    the announcement up on its next cycle and fans out to matching citizens.
+    Sending here meant one commit and one blocking FCM call per recipient
+    inside this handler, and a delivery failure was swallowed behind a 201.
 
     **Roles**: any admin.
     """
@@ -2538,7 +2724,7 @@ def create_announcement(
         db.refresh(ann)
 
         # Push notifications to matching citizens
-        _push_announcement(ann, db)
+        _queue_announcement_push(ann)
     except HTTPException:
         raise
     except Exception as e:
@@ -2581,7 +2767,7 @@ def list_announcements(
 
         if active_only:
             query = query.filter(
-                (Announcement.expires_at.is_(None)) | (Announcement.expires_at > datetime.utcnow())
+                (Announcement.expires_at.is_(None)) | (Announcement.expires_at > now_utc())
             )
 
         total = query.count()
@@ -2617,12 +2803,20 @@ def list_flags(
     status_filter: Optional[str] = Query(None, alias="status", description="pending|reviewed|dismissed"),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=200),
-    _current_user: User = Depends(require_any_admin),
+    current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """List content flags/reports for moderation. **Roles**: any admin."""
+    """List content flags/reports for moderation. **Roles**: any admin (scoped).
+
+    Scoped to the admin's jurisdiction. This returned every flag in the system
+    to any of the four admin roles, so a single-ward moderator saw — and could
+    act on — reports from every ward in the state.
+    """
     try:
         query = db.query(IssueFlag)
+        allowed = scoped_issue_ids(current_user, db)
+        if allowed is not None:
+            query = query.filter(IssueFlag.issue_id.in_(allowed))
         if status_filter:
             query = query.filter(IssueFlag.status == status_filter)
         total = query.count()
@@ -2646,8 +2840,14 @@ def update_flag(
     """Mark a flag as reviewed or dismissed. **Roles**: any admin."""
     if flag_status not in ("reviewed", "dismissed"):
         raise HTTPException(status_code=400, detail="status must be 'reviewed' or 'dismissed'")
-    flag = db.query(IssueFlag).filter(IssueFlag.id == flag_id).first()
+    query = db.query(IssueFlag).filter(IssueFlag.id == flag_id)
+    allowed = scoped_issue_ids(current_user, db)
+    if allowed is not None:
+        query = query.filter(IssueFlag.issue_id.in_(allowed))
+    flag = query.first()
     if not flag:
+        # 404 rather than 403 — an out-of-jurisdiction flag should not be
+        # distinguishable from one that does not exist.
         raise HTTPException(status_code=404, detail="Flag not found")
     flag.status = flag_status
     db.commit()
@@ -2693,7 +2893,10 @@ def get_heatmap(
 def heatmap_time_machine(
     start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
-    interval_days: int = Query(1, description="Interval in days for each snapshot"),
+    # ge=1: with no lower bound, interval_days=0 made `current += timedelta(days=0)`
+    # loop forever appending a snapshot dict each pass, until the process was
+    # OOM-killed. One GET from any admin role took the pod down.
+    interval_days: int = Query(1, ge=1, le=365, description="Interval in days for each snapshot"),
     issue_type: Optional[str] = Query(None),
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
@@ -2792,7 +2995,7 @@ def get_active_sos(
         )
         sos_issues = apply_not_deleted_filter(sos_issues).all()
 
-        now = datetime.utcnow()
+        now = now_utc()
         result = []
         for i in sos_issues:
             elapsed = now - i.created_at.replace(tzinfo=None)
@@ -2837,7 +3040,10 @@ def create_squad(
     try:
         from app.models.issue_squad import IssueSquad
 
+        # Scoped: this assigned a lead worker to any issue in the country for
+        # any of the four admin roles.
         issue = db.query(Issue).filter(Issue.id == issue_id)
+        issue = apply_admin_scope(issue, current_user, Issue)
         issue = apply_not_deleted_filter(issue).first()
         if not issue:
             raise HTTPException(status_code=404, detail="Issue not found")
@@ -3059,7 +3265,9 @@ def create_geofence(
             validate_geofence_radius(body.radius_km)
             validate_geofence_area(body.radius_km)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            # ValueError from the geofence validators — those messages are
+            # written for operators and are safe, but bound the length.
+            raise HTTPException(status_code=400, detail=str(e)[:200])
         
         # MEDIUM PRIORITY BUG FIX #4: Check for overlapping geofences
         existing_geofences = db.query(Geofence).all()
@@ -3218,7 +3426,7 @@ def get_analytics(
 ):
     """Trend data for dashboard charts (scoped). **Roles**: any admin."""
     try:
-        since = datetime.utcnow() - timedelta(days=days)
+        since = now_utc() - timedelta(days=days)
         issues = (
             apply_admin_scope(db.query(Issue), current_user, Issue)
             .filter(Issue.created_at >= since)
@@ -3260,7 +3468,9 @@ def get_analytics(
 def send_geofence_notification(
     latitude: float = Query(..., description="Center latitude"),
     longitude: float = Query(..., description="Center longitude"),
-    radius_km: float = Query(..., description="Radius in kilometers"),
+    # le: unbounded, radius_km=99999 push-notified every user in the country
+    # with an attacker-controlled title and body, from any admin role.
+    radius_km: float = Query(..., gt=0, le=50, description="Radius in kilometers (max 50)"),
     title: str = Query(..., description="Notification title"),
     body: str = Query(..., description="Notification body"),
     location_lat: Optional[float] = Query(None, description="Clickable map location latitude (defaults to center)"),
@@ -3312,14 +3522,30 @@ def send_geofence_notification(
             cos_angle = max(-1, min(1, cos_angle))
             return R * acos(cos_angle)
 
-        # Query all citizens and workers with location data and FCM tokens
-        users = db.query(User).filter(
-            User.is_active == True,
-            User.latitude.isnot(None),
-            User.longitude.isnot(None),
-            User.fcm_token.isnot(None),
-            User.role.in_(["citizen", "worker"]),  # Only notify citizens and workers
-        ).all()
+        # Candidates with location data and an FCM token, pre-filtered by a
+        # bounding box before the exact haversine check below, and capped.
+        #
+        # This pulled the entire user table into memory — every active citizen
+        # and worker in the country — and then filtered in Python. With the
+        # radius now bounded at 50 km the box is small, but the cap stays as a
+        # backstop: a single request must not be able to fan out without limit.
+        lat_delta = radius_km / 111.0
+        lon_delta = radius_km / max(111.0 * abs(cos(lat_rad)), 1e-6)
+
+        users = (
+            db.query(User)
+            .filter(
+                User.is_active == True,  # noqa: E712
+                User.latitude.isnot(None),
+                User.longitude.isnot(None),
+                User.fcm_token.isnot(None),
+                User.role.in_(["citizen", "worker"]),
+                User.latitude.between(latitude - lat_delta, latitude + lat_delta),
+                User.longitude.between(longitude - lon_delta, longitude + lon_delta),
+            )
+            .limit(settings.GEOFENCE_NOTIFY_MAX_RECIPIENTS)
+            .all()
+        )
 
         logger.debug(f"Found {len(users)} users with location data and FCM tokens")
 
@@ -3374,23 +3600,85 @@ def send_geofence_notification(
 
 # ── Private helpers ───────────────────────────────────────────────────────────
 
-def _user_scope_filter(admin_user: User) -> list:
-    """Build SQLAlchemy filter conditions for User queries based on admin scope."""
-    if admin_user.role == "admin":
-        return []
-    if admin_user.role == "district_admin" and admin_user.district_id:
-        return [User.district_id == admin_user.district_id]
-    if admin_user.role == "taluka_admin" and admin_user.taluka_id:
-        return [User.taluka_id == admin_user.taluka_id]
-    if admin_user.role == "ward_admin" and admin_user.ward_id:
-        return [User.ward_id == admin_user.ward_id]
-    return []
+def scoped_issue_ids(current_user: User, db: Session):
+    """Subquery of the issue IDs this admin may act on.
+
+    Several admin resources — flags, disputes, squads, surveys — are not
+    themselves geographic but hang off an issue that is. Filtering them by
+    ``<model>.issue_id.in_(scoped_issue_ids(...))`` gives them the same
+    jurisdiction boundary as the issue list, in one place.
+
+    Returns ``None`` for a super-admin, meaning "no restriction" — callers
+    should skip the filter entirely rather than applying an always-true one.
+    """
+    if current_user.role == "admin":
+        return None
+    return apply_admin_scope(db.query(Issue.id), current_user, Issue).scalar_subquery()
+
+
+def _assert_scope_within_caller(
+    caller: User,
+    *,
+    ward_id: uuid.UUID | None,
+    taluka_id: uuid.UUID | None,
+    district_id: uuid.UUID | None,
+    db: Session,
+) -> None:
+    """Reject a scope assignment that reaches outside the caller's own jurisdiction.
+
+    The super-admin may assign anything. Everyone else may only assign a scope
+    contained within their own, verified by walking Ward → Taluka → District
+    rather than trusting the three FK columns to be mutually consistent.
+
+    Without this, ``_user_scope_filter`` was the only gate on ``PUT
+    /admin/admins/{id}`` — and for a taluka_admin it returns ``User.taluka_id ==
+    <own taluka>``, a predicate the caller themselves satisfies. So a
+    taluka_admin could target their *own* id and move themselves into a
+    different taluka, which the filter then happily accepted on the next request.
+    """
+    if caller.role == "admin":
+        return
+
+    if district_id is not None:
+        if caller.role != "district_admin" or district_id != caller.district_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot assign a district outside your own jurisdiction",
+            )
+
+    if taluka_id is not None:
+        taluka = db.query(Taluka).filter(Taluka.id == taluka_id).first()
+        if not taluka:
+            raise HTTPException(status_code=404, detail="Taluka not found")
+        if caller.role == "district_admin":
+            if taluka.district_id != caller.district_id:
+                raise HTTPException(status_code=403, detail="That taluka is outside your district")
+        elif caller.role == "taluka_admin":
+            if taluka_id != caller.taluka_id:
+                raise HTTPException(status_code=403, detail="That taluka is outside your jurisdiction")
+        else:
+            raise HTTPException(status_code=403, detail="You cannot assign a taluka")
+
+    if ward_id is not None:
+        ward = db.query(Ward).filter(Ward.id == ward_id).first()
+        if not ward:
+            raise HTTPException(status_code=404, detail="Ward not found")
+        taluka = db.query(Taluka).filter(Taluka.id == ward.taluka_id).first()
+        if caller.role == "ward_admin":
+            if ward_id != caller.ward_id:
+                raise HTTPException(status_code=403, detail="That ward is outside your jurisdiction")
+        elif caller.role == "taluka_admin":
+            if not taluka or taluka.id != caller.taluka_id:
+                raise HTTPException(status_code=403, detail="That ward is outside your taluka")
+        elif caller.role == "district_admin":
+            if not taluka or taluka.district_id != caller.district_id:
+                raise HTTPException(status_code=403, detail="That ward is outside your district")
 
 
 def _get_scoped_worker(worker_id: uuid.UUID, admin_user: User, db: Session) -> User:
     """Fetch a worker by ID, scoped to the admin's geographic area."""
     query = db.query(User).filter(User.id == worker_id, User.role == "worker")
-    scope = _user_scope_filter(admin_user)
+    scope = user_scope_filter(admin_user)
     if scope:
         query = query.filter(*scope)
     worker = query.first()
@@ -3429,36 +3717,11 @@ def _flag_out(f: IssueFlag) -> dict:
     }
 
 
-def _push_announcement(ann: Announcement, db: Session):
-    """Persist DB notifications and send FCM push to all citizens matching the announcement scope."""
-    try:
-        from app.services.notification_service import notify
+def _queue_announcement_push(ann: Announcement) -> None:
+    """Mark an announcement for fan-out by the ``jobs`` service.
 
-        query_results = get_users_by_role("citizen", db)
-        query = db.query(User).filter(User.id.in_([u.id for u in query_results]))
-
-        if ann.scope == "ward" and ann.ward_id:
-            query = query.filter(User.ward_id == ann.ward_id)
-        elif ann.scope == "taluka" and ann.taluka_id:
-            query = query.filter(User.taluka_id == ann.taluka_id)
-        elif ann.scope == "district" and ann.district_id:
-            query = query.filter(User.district_id == ann.district_id)
-        # scope == "state" → no additional filter (all citizens)
-
-        count = 0
-        for citizen in query.all():
-            notify(
-                db=db,
-                user_id=str(citizen.id),
-                title=ann.title,
-                body=ann.body,
-                notification_type="system",
-                fcm_token=citizen.fcm_token,
-                location_lat=ann.location_lat,
-                location_lng=ann.location_lng,
-            )
-            count += 1
-
-        logger.info(f"Announcement {ann.id} push sent to {count} citizens")
-    except Exception as e:
-        logger.warning(f"Announcement push failed (non-fatal): {e}")
+    Deliberately does nothing but leave ``push_dispatched_at`` NULL — the actual
+    delivery happens in ``run_announcement_push_pass`` in app/main.py. See the
+    note on ``Announcement.push_dispatched_at`` for why this is not done inline.
+    """
+    ann.push_dispatched_at = None

@@ -27,8 +27,9 @@ Required ``.env`` keys:
   ``AADHAR_KYC_URL``        = provider base URL
   ``AADHAR_KYC_ACCOUNT_ID`` = (IDfy only) account identifier
 
-DEV_MODE:
-  Fully mocked — no real API calls, OTP printed to console.
+AADHAAR_BACKEND="console":
+  Fully mocked — no real API calls, OTP printed to console and returned in the
+  response. Rejected in production by ``validate_settings()``.
 """
 
 import hashlib
@@ -36,6 +37,7 @@ import re
 import uuid as _uuid
 from typing import Optional
 
+from app.core.time import now_utc
 from app.core.config import settings
 from app.core.logger import get_logger
 
@@ -91,7 +93,7 @@ def _masked(aadhaar_number: str) -> str:
 
 
 async def _dev_send_otp(aadhaar_number: str, db) -> dict:
-    """Mock Aadhaar OTP send for DEV_MODE — stores OTP in DB, logs to console.
+    """Mock Aadhaar OTP send for the console backend — stores OTP in DB, logs to console.
 
     Args:
         aadhaar_number: Aadhaar number to mock-send OTP for.
@@ -100,11 +102,14 @@ async def _dev_send_otp(aadhaar_number: str, db) -> dict:
     Returns:
         Dict with ``client_id``, ``txn_id``, ``message``, and ``dev_otp``.
     """
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models.otp import OTP
     from app.services.auth_service import generate_otp
 
-    key = f"{_AADHAR_PREFIX}{aadhaar_number}"
+    # Key on the hash, never the raw number: this value is written to
+    # otps.phone, and the module contract is that plaintext Aadhaar is never
+    # persisted. Verification derives the same key the same way.
+    key = f"{_AADHAR_PREFIX}{hash_aadhar(aadhaar_number)}"
     client_id = str(_uuid.uuid4())
 
     # Invalidate any previous unused OTPs for this Aadhaar
@@ -112,20 +117,20 @@ async def _dev_send_otp(aadhaar_number: str, db) -> dict:
     db.commit()
 
     code = generate_otp()
-    db.add(OTP(phone=key, code=code, expires_at=datetime.utcnow() + timedelta(minutes=10)))
+    db.add(OTP(phone=key, code=code, expires_at=now_utc() + timedelta(minutes=10)))
     db.commit()
 
-    logger.info(f"[DEV] Aadhaar OTP for {_masked(aadhaar_number)}: {code}")
+    logger.info(f"[console] Aadhaar OTP for {_masked(aadhaar_number)}: {code}")
     return {
         "client_id": client_id,
-        "message": "OTP sent to Aadhaar-linked mobile (DEV mock)",
+        "message": "OTP sent to Aadhaar-linked mobile (console mock)",
         "dev_otp": code,
         "txn_id": client_id,
     }
 
 
 async def _dev_verify_otp(aadhaar_number: str, otp: str, db) -> Optional[dict]:
-    """Mock Aadhaar OTP verification for DEV_MODE — checks OTP from DB.
+    """Mock Aadhaar OTP verification for the console backend — checks OTP from DB.
 
     Args:
         aadhaar_number: Aadhaar number being verified.
@@ -135,25 +140,24 @@ async def _dev_verify_otp(aadhaar_number: str, otp: str, db) -> Optional[dict]:
     Returns:
         Mock demographic dict on success, None if OTP is invalid/expired.
     """
-    from datetime import datetime
     from app.models.otp import OTP
 
-    key = f"{_AADHAR_PREFIX}{aadhaar_number}"
+    key = f"{_AADHAR_PREFIX}{hash_aadhar(aadhaar_number)}"
     record = db.query(OTP).filter(
         OTP.phone == key,
         OTP.code == otp,
         OTP.is_used == False,
-        OTP.expires_at > datetime.utcnow(),
+        OTP.expires_at > now_utc(),
     ).first()
 
     if not record:
-        logger.warning(f"[DEV] Invalid or expired Aadhaar OTP for {_masked(aadhaar_number)}")
+        logger.warning(f"[console] Invalid or expired Aadhaar OTP for {_masked(aadhaar_number)}")
         return None
 
     record.is_used = True
     db.commit()
 
-    logger.info(f"[DEV] Aadhaar OTP verified for {_masked(aadhaar_number)}")
+    logger.info(f"[console] Aadhaar OTP verified for {_masked(aadhaar_number)}")
     return {
         "verified": True,
         "name": "Aadhaar Test User",
@@ -198,8 +202,11 @@ async def _surepass_send_otp(aadhaar_number: str) -> dict:
         except httpx.TimeoutException:
             logger.error("Surepass API timed out during OTP send")
             raise RuntimeError("Aadhaar KYC provider timed out. Please try again.")
-        except httpx.ConnectError:
-            logger.error("Cannot reach Surepass API")
+        # HTTPError is the base class: it also covers UnsupportedProtocol and
+        # InvalidURL, which a malformed AADHAR_KYC_URL raises. Catching only
+        # ConnectError let those escape as an unhandled 500.
+        except httpx.HTTPError as e:
+            logger.error("Cannot reach Surepass API: %s", type(e).__name__)
             raise RuntimeError("Cannot reach Aadhaar KYC provider. Check network.")
 
     if resp.status_code == 401:
@@ -256,6 +263,9 @@ async def _surepass_verify_otp(client_id: str, otp: str) -> Optional[dict]:
         except httpx.TimeoutException:
             logger.error("Surepass API timed out during OTP verification")
             raise RuntimeError("Aadhaar KYC provider timed out. Please try again.")
+        except httpx.HTTPError as e:
+            logger.error("Cannot reach Surepass API: %s", type(e).__name__)
+            raise RuntimeError("Cannot reach Aadhaar KYC provider. Check network.")
 
     if not resp.is_success:
         logger.warning(f"Surepass OTP verify failed {resp.status_code}: {resp.text[:200]}")
@@ -321,6 +331,9 @@ async def _idfy_send_otp(aadhaar_number: str) -> dict:
         except httpx.TimeoutException:
             logger.error("IDfy API timed out during OTP send")
             raise RuntimeError("IDfy KYC provider timed out.")
+        except httpx.HTTPError as e:
+            logger.error("Cannot reach IDfy API: %s", type(e).__name__)
+            raise RuntimeError("Cannot reach Aadhaar KYC provider. Check network.")
 
     if not resp.is_success:
         logger.error(f"IDfy OTP error {resp.status_code}: {resp.text[:200]}")
@@ -375,6 +388,9 @@ async def _idfy_verify_otp(aadhaar_number: str, otp: str, request_id: str) -> Op
         except httpx.TimeoutException:
             logger.error("IDfy API timed out during OTP verification")
             raise RuntimeError("IDfy KYC provider timed out.")
+        except httpx.HTTPError as e:
+            logger.error("Cannot reach IDfy API: %s", type(e).__name__)
+            raise RuntimeError("Cannot reach Aadhaar KYC provider. Check network.")
 
     if not resp.is_success:
         logger.warning(f"IDfy OTP verify failed {resp.status_code}: {resp.text[:200]}")
@@ -404,34 +420,47 @@ async def _idfy_verify_otp(aadhaar_number: str, otp: str, request_id: str) -> Op
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
+def _require_kyc_config() -> None:
+    """Raise unless the KYC provider is fully configured.
+
+    Both the send and verify paths need this. Verify used to skip it, so a
+    missing URL produced a 500 instead of a 503.
+
+    Raises:
+        RuntimeError: If the API key or base URL is missing.
+    """
+    if not settings.AADHAR_KYC_API_KEY:
+        logger.error("AADHAR_KYC_API_KEY is not configured")
+        raise RuntimeError("Aadhaar KYC is not configured")
+    if not settings.AADHAR_KYC_URL:
+        logger.error("AADHAR_KYC_URL is not configured")
+        raise RuntimeError("Aadhaar KYC is not configured")
+
+
 async def send_aadhar_otp(aadhaar_number: str, db) -> dict:
     """Request an OTP for the given Aadhaar number (provider-agnostic).
 
-    Routes to the configured KYC provider based on ``AADHAR_KYC_PROVIDER``.
-    In DEV_MODE, uses a fully mocked implementation.
+    Routes to the configured KYC provider based on ``AADHAAR_BACKEND``.
+    With ``AADHAAR_BACKEND="console"``, uses a fully mocked implementation.
 
     Args:
         aadhaar_number: 12-digit Aadhaar number (pre-validated by caller).
-        db:             SQLAlchemy session (used in DEV_MODE only).
+        db:             SQLAlchemy session (used by the console backend only).
 
     Returns:
-        Dict with ``client_id``, ``txn_id``, ``message`` (and ``dev_otp`` in DEV_MODE).
+        Dict with ``client_id``, ``txn_id``, ``message`` (and ``dev_otp`` with
+        the console backend).
 
     Raises:
         RuntimeError: On provider configuration error or API failure.
         ValueError:   On invalid Aadhaar number as per provider.
     """
-    if settings.DEV_MODE:
+    if settings.AADHAAR_BACKEND == "console":
         return await _dev_send_otp(aadhaar_number, db)
 
-    if not settings.AADHAR_KYC_API_KEY:
-        logger.error("AADHAR_KYC_API_KEY is not configured")
-        raise RuntimeError("AADHAR_KYC_API_KEY is not configured")
-    if not settings.AADHAR_KYC_URL:
-        logger.error("AADHAR_KYC_URL is not configured")
-        raise RuntimeError("AADHAR_KYC_URL is not configured")
+    _require_kyc_config()
 
-    provider = settings.AADHAR_KYC_PROVIDER.lower()
+    provider = settings.AADHAAR_BACKEND
     logger.info(f"Sending Aadhaar OTP via provider '{provider}' for {_masked(aadhaar_number)}")
 
     if provider == "surepass":
@@ -439,20 +468,20 @@ async def send_aadhar_otp(aadhaar_number: str, db) -> dict:
     elif provider == "idfy":
         return await _idfy_send_otp(aadhaar_number)
     else:
-        raise RuntimeError(f"Unknown AADHAR_KYC_PROVIDER: '{provider}'. Use 'surepass' or 'idfy'.")
+        raise RuntimeError(f"Unknown AADHAAR_BACKEND: '{provider}'. Use 'surepass' or 'idfy'.")
 
 
 async def verify_aadhar_otp(aadhaar_number: str, otp: str, client_id: str, db) -> Optional[dict]:
     """Verify an Aadhaar OTP (provider-agnostic).
 
-    Routes to the configured KYC provider. In DEV_MODE, checks against the
-    OTP stored in the database by ``send_aadhar_otp``.
+    Routes to the configured KYC provider. With ``AADHAAR_BACKEND="console"``,
+    checks against the OTP stored in the database by ``send_aadhar_otp``.
 
     Args:
         aadhaar_number: 12-digit Aadhaar number.
         otp:            6-digit OTP from the Aadhaar-linked mobile.
         client_id:      Transaction ID returned by ``send_aadhar_otp``.
-        db:             SQLAlchemy session (used in DEV_MODE only).
+        db:             SQLAlchemy session (used by the console backend only).
 
     Returns:
         Demographic dict (verified, name, gender, dob, state, zip) on success,
@@ -461,10 +490,17 @@ async def verify_aadhar_otp(aadhaar_number: str, otp: str, client_id: str, db) -
     Raises:
         RuntimeError: On provider configuration error or API failure.
     """
-    if settings.DEV_MODE:
+    if settings.AADHAAR_BACKEND == "console":
         return await _dev_verify_otp(aadhaar_number, otp, db)
 
-    provider = settings.AADHAR_KYC_PROVIDER.lower()
+    # This guard was missing while the send side had it. With AADHAR_KYC_URL
+    # empty, httpx was handed a bare path like "/aadhaar-v2/submit-otp" and
+    # raised UnsupportedProtocol — which is neither TimeoutException nor
+    # ConnectError, so it escaped the handlers below and surfaced as an opaque
+    # HTTP 500 to a user who had already received their OTP.
+    _require_kyc_config()
+
+    provider = settings.AADHAAR_BACKEND
     logger.info(f"Verifying Aadhaar OTP via provider '{provider}'")
 
     if provider == "surepass":
@@ -473,4 +509,4 @@ async def verify_aadhar_otp(aadhaar_number: str, otp: str, client_id: str, db) -
     elif provider == "idfy":
         return await _idfy_verify_otp(aadhaar_number, otp, client_id)
     else:
-        raise RuntimeError(f"Unknown AADHAR_KYC_PROVIDER: '{provider}'. Use 'surepass' or 'idfy'.")
+        raise RuntimeError(f"Unknown AADHAAR_BACKEND: '{provider}'. Use 'surepass' or 'idfy'.")

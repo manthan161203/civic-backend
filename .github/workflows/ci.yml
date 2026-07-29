@@ -1,0 +1,181 @@
+name: CI
+
+# Nothing gated a merge before this: no workflow, no linting, no test run, and
+# for most of the project's life no tests to run. The three linters pinned in
+# requirements.txt had never been executed.
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install tooling
+        run: pip install ruff==0.16.0 black==26.5.1
+
+      - name: ruff
+        run: ruff check .
+
+      - name: black --check
+        run: black --check .
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: civic
+          POSTGRES_PASSWORD: civic
+          POSTGRES_DB: civic_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U civic -d civic_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql://civic:civic@localhost:5432/civic_test
+      TEST_DATABASE_URL: postgresql://civic:civic@localhost:5432/civic_test
+      SECRET_KEY: ci-secret-key-not-for-production-0123456789abcdef
+      SMS_BACKEND: console
+      EMAIL_BACKEND: console
+      PUSH_BACKEND: console
+      AADHAAR_BACKEND: console
+      GOOGLE_AUTH_BACKEND: console
+      RUN_BACKGROUND_JOBS: "false"
+      LOG_TO_FILE: "false"
+      LOG_LEVEL: WARNING
+      PUBLIC_BASE_URL: http://testserver
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+  migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: civic
+          POSTGRES_PASSWORD: civic
+          POSTGRES_DB: civic
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U civic -d civic"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql://civic:civic@localhost:5432/civic
+      SECRET_KEY: ci-secret-key-not-for-production-0123456789abcdef
+      SMS_BACKEND: console
+      EMAIL_BACKEND: console
+      PUSH_BACKEND: console
+      AADHAAR_BACKEND: console
+      GOOGLE_AUTH_BACKEND: console
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Exactly one migration head
+        # Multiple heads mean `alembic upgrade head` fails at deploy time. This
+        # repo shipped with three for months.
+        run: |
+          heads=$(alembic heads | grep -c '(head)')
+          echo "heads: $heads"
+          test "$heads" -eq 1
+
+      - name: Migrations apply to an empty database
+        run: alembic upgrade head
+
+      - name: Models match the schema
+        # Catches a model change that nobody wrote a migration for — the class
+        # of bug that had autogenerate wanting to DROP the admin audit table.
+        run: alembic check
+
+      - name: Migrations are reversible to the merge point
+        # Not all the way down: three integrity migrations are documented as
+        # non-reversible. This checks that the recent ones are.
+        run: |
+          alembic downgrade -3
+          alembic upgrade head
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Production image must not contain test tooling
+        run: |
+          docker build -t civic-ci-check .
+          ! docker run --rm civic-ci-check python -c "import pytest" 2>/dev/null
+          ! docker run --rm civic-ci-check python -c "import ruff" 2>/dev/null
+          docker run --rm civic-ci-check python -c "import bleach; print('bleach present')"

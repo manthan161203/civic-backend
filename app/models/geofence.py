@@ -32,7 +32,14 @@ class Geofence(Base):
     radius_km = Column(Float, nullable=False)  # Must be > 0
     
     # Audit fields
-    created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    # Nullable so the FK's ON DELETE SET NULL can actually fire — see migration
+    # s1t2u3v4w5. While this was NOT NULL, deleting the creating admin failed.
+    created_by_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     

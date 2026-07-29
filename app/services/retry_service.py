@@ -15,7 +15,12 @@ import random
 from typing import TypeVar, Callable, Any, Optional
 from functools import wraps
 
-from sqlalchemy.exc import OperationalError, DatabaseError, StatementError
+from sqlalchemy.exc import (
+    DataError,
+    IntegrityError,
+    OperationalError,
+    ProgrammingError,
+)
 from sqlalchemy.orm import Session
 
 from app.core.logger import get_logger
@@ -24,11 +29,18 @@ logger = get_logger("retry_service")
 
 T = TypeVar('T')
 
-# Transient errors that should trigger a retry
-TRANSIENT_ERRORS = (
-    OperationalError,           # Connection errors
-    DatabaseError,              # Temporary database issues
-)
+# Transient errors that should trigger a retry.
+#
+# OperationalError only. DatabaseError is its **parent** and also the parent of
+# IntegrityError, ProgrammingError, DataError and InternalError — so listing it
+# made every unique-constraint violation and every SQL syntax error "transient".
+# Those cannot succeed on a retry: the request just took an extra ~1.5s and held
+# a pooled connection (the pool is 5 + 2 overflow) before failing anyway.
+TRANSIENT_ERRORS = (OperationalError,)
+
+# Errors that are permanent by definition, listed explicitly so a future edit
+# that widens TRANSIENT_ERRORS cannot silently swallow them.
+PERMANENT_ERRORS = (IntegrityError, ProgrammingError, DataError)
 
 
 class RetryConfig:
@@ -126,6 +138,7 @@ def execute_with_retry(
     func: Callable[..., T],
     *args,
     config: Optional[RetryConfig] = None,
+    session: Optional[Session] = None,
     **kwargs
 ) -> T:
     """Execute a function with exponential backoff retry logic.
@@ -134,6 +147,10 @@ def execute_with_retry(
         func: Function to execute
         args: Positional arguments for func
         config: RetryConfig instance (uses defaults if None)
+        session: The Session ``func`` uses, if any. Rolled back between attempts
+                 — an OperationalError invalidates the session, so retrying on
+                 it without a rollback raises PendingRollbackError instead of
+                 recovering.
         kwargs: Keyword arguments for func
 
     Returns:
@@ -150,8 +167,22 @@ def execute_with_retry(
     for attempt in range(config.max_retries):
         try:
             return func(*args, **kwargs)
+        except PERMANENT_ERRORS:
+            # Never retried. Listed before TRANSIENT_ERRORS because these are
+            # subclasses of DatabaseError and would otherwise be caught below.
+            raise
         except TRANSIENT_ERRORS as e:
             last_exception = e
+
+            # After an OperationalError the Session is invalidated: re-issuing a
+            # query on it raises PendingRollbackError rather than recovering.
+            # The retry loop did not roll back, so every "retry" was guaranteed
+            # to fail with a different, more confusing error.
+            if session is not None:
+                try:
+                    session.rollback()
+                except Exception as rb:
+                    logger.warning(f"Rollback before retry failed: {rb}")
 
             if attempt < config.max_retries - 1:
                 delay = config.get_delay(attempt)

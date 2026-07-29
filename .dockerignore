@@ -39,7 +39,12 @@ logs/
 uploads/
 *.log
 
-# Tests & docs
-test_api.py
+# Docs
 *.md
 git_commands.md
+
+# NOTE: tests/ is deliberately NOT excluded. The `tests` compose service runs
+# pytest inside this image against the real Postgres service, so the suite has
+# to be present. It is a few KB and imports nothing the runtime does not already
+# have. The old `test_api.py` exclusion was here because that file fired 136
+# live HTTP requests at import time; it has been deleted.

@@ -13,10 +13,10 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.time import now_utc
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.issue import Issue
-from app.models.user import User
 
 logger = get_logger("public")
 
@@ -42,7 +42,7 @@ def ward_health_leaderboard(
         Sorted list of ward health entries (rank, ward, score breakdown).
     """
     try:
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = now_utc() - timedelta(days=days)
 
         # Aggregate per ward
         rows = (

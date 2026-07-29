@@ -1,0 +1,68 @@
+# Tooling configuration.
+#
+# black, ruff and mypy have been pinned in requirements.txt since the project
+# started and were never configured or run by anything. This file gives them
+# settings that match the code as it actually is, so `ruff check .` is a signal
+# rather than thousands of lines of noise nobody will read.
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+extend-exclude = "alembic/versions"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# Migrations are generated and then hand-edited; they follow different
+# conventions and linting them produces churn without value.
+exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+# Deliberately narrow: rules that catch **bugs**, not rules that restyle the
+# codebase.
+#
+# The full default set plus UP/I reports ~800 findings here, almost all of it
+# `Optional[X]` → `X | None`, import reordering and `Dict` → `dict`. Landing
+# that as a mechanical diff across 24k lines would bury every behavioural change
+# and carries real risk for zero correctness gain — and a linter that fires 800
+# times on its first run is a linter someone switches off within a day.
+#
+# Modernisation rules (UP, I, C4) are worth enabling later as a single dedicated
+# commit, reviewed on its own. They are not worth mixing into a bug-fix pass.
+select = [
+    "F",    # pyflakes — undefined names, unused imports, f-string mistakes
+    "E9",   # syntax and IO errors
+    "B",    # bugbear — mutable defaults, unused loop variables, except-clause bugs
+    "T20",  # print() left in application code
+]
+ignore = [
+    "B008",  # function call in default arg: Depends()/Query() are the FastAPI idiom
+    "B904",  # raise-without-from inside except: pervasive, and every case here
+             # deliberately replaces provider/DB text with a fixed message
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export modules: the imports exist to populate the package namespace.
+"app/models/__init__.py" = ["F401"]
+# Scripts are CLIs; print() is their output.
+"scripts/*" = ["T20"]
+"create_admin.py" = ["T20", "F401"]
+"run.py" = ["T20"]
+
+[tool.mypy]
+python_version = "3.13"
+# Deliberately not strict. The codebase is largely unannotated, so strict mode
+# would report thousands of errors and be switched off within a day. These
+# settings catch the things that are wrong regardless of annotation coverage.
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = false
+exclude = ["alembic/", "tests/"]
+
+[tool.pytest.ini_options]
+# pytest.ini remains the source of truth — see the note there about
+# PytestReturnNotNoneWarning. This section exists only so `pytest --co` from a
+# tool that reads pyproject still finds the right rootdir.
+minversion = "8.0"

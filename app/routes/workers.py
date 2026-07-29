@@ -11,13 +11,14 @@ Frontend Integration Notes:
 """
 
 import uuid
-from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
+from app.core.time import now_local, now_utc
 from app.core.deps import require_role
 from app.core.logger import get_logger
 from app.database import get_db
@@ -27,7 +28,8 @@ from app.schemas.issue import IssueResponse
 from app.schemas.worker import TaskAcceptReject, WorkerStats, WorkerStatusUpdate, LocationUpdate
 from app.services.ai_service import verify_resolution
 from app.services.notification_service import notify_bookmarkers, notify_localized, send_sms_status_update
-from app.services.storage import upload_image
+from app.core.exceptions import CivicException
+from app.services.storage import upload_image_or_raise
 from app.services.utils import get_users_by_role
 
 logger = get_logger("workers")
@@ -93,7 +95,7 @@ def worker_leaderboard(
         403: Not a worker.
     """
     try:
-        from sqlalchemy import func as _func, case as _case
+        from sqlalchemy import func as _func
         from app.models.issue import Issue as _Issue
 
         # Single aggregated query instead of N+1 per-worker queries
@@ -112,7 +114,6 @@ def worker_leaderboard(
         worker_ids = {w.id for w in workers}
 
         # Fetch stats in one go
-        from sqlalchemy.orm import Session as _S
         stat_rows = (
             db.query(stats_q.c.assigned_worker_id, stats_q.c.resolved, stats_q.c.avg_rating)
             .filter(stats_q.c.assigned_worker_id.in_(worker_ids))
@@ -384,7 +385,7 @@ def reject_task(
         # Auto-escalate if rejection threshold reached
         if issue.reassignment_count >= REJECTION_ESCALATION_THRESHOLD and not issue.is_escalated:
             issue.is_escalated = True
-            issue.escalated_at = datetime.utcnow()
+            issue.escalated_at = now_utc()
             db.commit()
             admins = get_users_by_role("admin", db)
             for admin_user in admins:
@@ -511,21 +512,29 @@ async def resolve_task(
         400: Task is not in ``in_progress`` status.
         404: Task not found or not assigned to this worker.
     """
-    # Use FOR UPDATE lock to prevent concurrent rejection/resolution
-    issue = db.query(Issue).filter(
-        Issue.id == issue_id,
-        Issue.assigned_worker_id == current_user.id,
-    ).with_for_update().first()
-    if not issue:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found or not assigned to you")
-
-    if issue.status != "in_progress":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task must be in_progress to resolve")
-
     ALLOWED_PHOTO_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
     MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10 MB
 
+    # Unlocked pre-check, so an obviously invalid request fails fast without
+    # ever taking a row lock or uploading anything.
+    issue = db.query(Issue).filter(
+        Issue.id == issue_id,
+        Issue.assigned_worker_id == current_user.id,
+    ).first()
+    if not issue:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found or not assigned to you")
+    if issue.status != "in_progress":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task must be in_progress to resolve")
+
     try:
+        # ── Slow work first, outside the lock and outside any transaction ────
+        #
+        # The FOR UPDATE lock used to be taken *before* this and released only
+        # at the commit below, so it was held across a photo upload and an AI
+        # round-trip — seconds, over the network, per resolution. Any other
+        # request touching the row (a reassignment, a reject, an admin edit)
+        # blocked for the duration, and the connection was pinned the whole
+        # time out of a pool of 5+2.
         file_bytes = await after_photo.read()
 
         if len(file_bytes) > MAX_PHOTO_BYTES:
@@ -541,23 +550,49 @@ async def resolve_task(
                 detail=f"Invalid file type '{mime_type}'. Only JPEG, PNG, WebP, and GIF images are allowed.",
             )
         filename = f"after_{uuid.uuid4().hex[:8]}"
-        url = upload_image(file_bytes, filename, user_id=str(current_user.id), issue_id=str(issue_id))
-        if url:
-            issue.after_photos = (issue.after_photos or []) + [url]
-
-        # AI verification of resolution
+        # Raises on failure rather than dropping the photo. The after-photo is
+        # the proof-of-work artifact and feeds the AI resolution check below, so
+        # a resolution recorded without it is not worth much. The trade is that
+        # a storage outage blocks workers from marking issues resolved.
+        #
+        # run_in_threadpool because this is a synchronous upload (filesystem or
+        # Cloudinary HTTP) being called from an `async def` — awaiting it inline
+        # blocks the event loop for every other request in this worker.
+        url = await run_in_threadpool(
+            upload_image_or_raise,
+            file_bytes, filename,
+            user_id=str(current_user.id), issue_id=str(issue_id),
+        )
         ai_result = await verify_resolution(file_bytes, mime_type)
+
+        # ── Now take the lock and apply the state change ──────────────────────
+        # Re-read under FOR UPDATE and re-check the status: the slow work above
+        # gave a concurrent request time to reassign or resolve this task.
+        issue = db.query(Issue).filter(
+            Issue.id == issue_id,
+            Issue.assigned_worker_id == current_user.id,
+        ).with_for_update().first()
+        if not issue:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This task was reassigned while you were uploading",
+            )
+        if issue.status != "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"This task moved to '{issue.status}' while you were uploading",
+            )
+
+        issue.after_photos = (issue.after_photos or []) + [url]
         issue.ai_is_resolved = ai_result.get("is_resolved")
         issue.ai_resolution_quality = ai_result.get("resolution_quality")
         issue.ai_resolution_notes = ai_result.get("notes")
-
-        # Prepare all updates BEFORE first commit to ensure atomicity
         issue.status = "resolved"
-        issue.resolved_at = datetime.utcnow()
+        issue.resolved_at = now_utc()
         if resolution_notes:
             issue.resolution_notes = resolution_notes
 
-        # Single atomic commit for all issue updates
+        # Single atomic commit for all issue updates — releases the lock.
         db.commit()
         db.refresh(issue)
 
@@ -565,9 +600,16 @@ async def resolve_task(
         try:
             from app.services.rewards_service import award_event
             award_event(db, current_user.id, "resolve_issue", reference_id=issue.id)
-            # Fast resolve bonus: resolved within 24h of assignment
-            if issue.resolved_at and issue.updated_at:
-                hours_taken = (issue.resolved_at - issue.updated_at).total_seconds() / 3600
+            # Fast resolve bonus: resolved within 24h of assignment.
+            #
+            # Measured from assigned_at. It used to be measured from updated_at,
+            # but the db.commit() above fires the column's onupdate=func.now(),
+            # so updated_at was always the same instant as resolved_at and
+            # hours_taken was always ~0.0 — every single resolution earned the
+            # bonus, and the `fast_responder` badge (10 fast_resolve events) was
+            # really just "resolved 10 issues".
+            if issue.resolved_at and issue.assigned_at:
+                hours_taken = (issue.resolved_at - issue.assigned_at).total_seconds() / 3600
                 if hours_taken <= 24:
                     award_event(db, current_user.id, "fast_resolve", reference_id=issue.id,
                                 note=f"Resolved in {round(hours_taken, 1)}h (< 24h)")
@@ -616,9 +658,16 @@ async def resolve_task(
             )
         # Notify bookmarkers (#8)
         notify_bookmarkers(db, issue, "resolved")
-    except HTTPException:
+    except (HTTPException, CivicException):
+        # CivicException carries its own status (503 when storage is down) and
+        # is rendered by the handler in main.py — do not flatten it to a 500.
+        db.rollback()
         raise
     except Exception as e:
+        # Roll back explicitly: the CivicException branch above does, this one
+        # did not, so a failure here left the session dirty and holding the
+        # FOR UPDATE lock until get_db's teardown ran.
+        db.rollback()
         logger.error(f"Error resolving task {issue_id} by worker {current_user.id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -648,22 +697,28 @@ def get_worker_stats(
         403: Not a worker.
     """
     try:
-        from datetime import timezone, timedelta
-        # IST today window for "completed today"
-        IST = timezone(timedelta(hours=5, minutes=30))
-        now_ist = datetime.now(IST)
-        today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_start = today_start_ist.astimezone(timezone.utc)
+        # "Today" means the local calendar day, from settings.LOCAL_TIMEZONE,
+        # rather than a hardcoded +05:30 offset.
+        from datetime import timezone as _tz
 
-        # Total assigned (all time, any status)
+        now_local_dt = now_local()
+        today_start = now_local_dt.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).astimezone(_tz.utc)
+
+        # Assigned today. `today_start` is computed above and was then never
+        # used, so both of these counted the worker's entire history: a
+        # three-year veteran's dashboard reported "412 tasks completed today".
         assigned_today = db.query(func.count(Issue.id)).filter(
             Issue.assigned_worker_id == current_user.id,
+            Issue.assigned_at >= today_start,
         ).scalar() or 0
 
-        # Total completed (resolved or closed — closed is the final state after resolution)
+        # Completed today (resolved or closed — closed is the final state after resolution)
         completed_today = db.query(func.count(Issue.id)).filter(
             Issue.assigned_worker_id == current_user.id,
             Issue.status.in_(["resolved", "closed"]),
+            Issue.resolved_at >= today_start,
         ).scalar() or 0
 
         pending = db.query(func.count(Issue.id)).filter(
@@ -713,7 +768,7 @@ def update_location(
     try:
         current_user.latitude = body.latitude
         current_user.longitude = body.longitude
-        current_user.location_updated_at = datetime.utcnow()
+        current_user.location_updated_at = now_utc()
         db.commit()
     except Exception as e:
         logger.error(f"Error updating location for worker {current_user.id}: {e}", exc_info=True)
@@ -760,7 +815,7 @@ def block_task(
     try:
         issue.is_blocked = True
         issue.blocked_reason = reason
-        issue.blocked_at = datetime.utcnow()
+        issue.blocked_at = now_utc()
         issue.blocked_by_id = current_user.id
         issue.status = "in_progress"
         db.commit()

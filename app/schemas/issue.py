@@ -11,12 +11,13 @@ Frontend Integration Notes:
 - AI fields (``ai_*``) are populated automatically after photo upload — do not send them.
 """
 
+import math
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from app.core.sanitize import sanitize_comment, sanitize_description
 
 
@@ -308,14 +309,59 @@ class IssueResponse(BaseModel):
 class IssueListResponse(BaseModel):
     """Paginated list of issues.
 
+    Accepts either pagination convention and always reports both.
+
+    This schema previously declared only ``limit``/``offset``, but three of its
+    four call sites construct it with ``page``/``size`` — the query parameters
+    those endpoints actually take. Pydantic v2 ignores unknown keyword arguments
+    by default, so those three silently dropped the values and every response
+    claimed ``limit: 50, offset: 0`` regardless of the page requested. A client
+    computing ``offset + len(items)`` or ``total / limit`` paginated wrongly on
+    every one of them, while the fourth endpoint reported correctly — the same
+    schema describing two incompatible things.
+
+    Rather than pick a winner and break existing clients, the validator below
+    derives whichever pair was not supplied, so both are always correct.
+
     Attributes:
-        items: List of issues for the current page.
-        total: Total number of issues matching the filters.
-        limit: Number of items per page (limit parameter).
-        offset: Starting position (offset parameter).
+        items:  Issues for the current page.
+        total:  Total number of issues matching the filters.
+        page:   1-based page number.
+        size:   Items per page.
+        limit:  Alias for ``size``.
+        offset: Starting position, ``(page - 1) * size``.
+        pages:  Total number of pages.
     """
 
     items: List[IssueResponse]
     total: int
+    page: int = 1
+    size: int = 50
     limit: int = 50
     offset: int = 0
+    pages: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reconcile_pagination(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        page, size = values.get("page"), values.get("size")
+        limit, offset = values.get("limit"), values.get("offset")
+
+        if size is None and limit is not None:
+            size = limit
+        if size is None:
+            size = 50
+        if page is None:
+            page = (offset // size + 1) if offset else 1
+
+        values["size"] = size
+        values["limit"] = size
+        values["page"] = page
+        values["offset"] = offset if offset is not None else (page - 1) * size
+
+        total = values.get("total") or 0
+        values["pages"] = math.ceil(total / size) if size else 0
+        return values

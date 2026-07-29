@@ -44,7 +44,7 @@ DATABASE TRANSACTION UTILITIES:
 
 import uuid
 import logging
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session, Query
 

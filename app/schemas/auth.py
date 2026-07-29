@@ -5,7 +5,7 @@ Request/response models for all auth endpoints (OTP, Google, Aadhaar, tokens, pr
 
 Frontend Integration Notes:
 - All token endpoints return ``TokenResponse`` containing access + refresh tokens.
-- Access tokens expire in 15 minutes; use ``POST /auth/refresh`` to get a new pair.
+- Access tokens expire in 60 minutes; use ``POST /auth/refresh`` to get a new pair.
 - Phone numbers must include country code (e.g. ``+919876543210``).
 """
 
@@ -15,6 +15,11 @@ from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
+
+# These were defined in constants.py and referenced nowhere; every schema
+# hardcoded `min_length=8` and no schema had an upper bound at all, so a
+# multi-megabyte password string reached argon2.
+from app.core.constants import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
 
 
 # ── OTP / Phone auth ──────────────────────────────────────────────────────────
@@ -73,13 +78,50 @@ class GoogleLoginRequest(BaseModel):
     The client obtains an ``id_token`` from the Google Sign-In SDK and sends it here.
     The backend verifies the token with Google and returns JWT tokens.
 
-    In **DEV_MODE**, ``id_token`` can be any arbitrary string (treated as a mock google_id).
-
     Attributes:
         id_token: Google ID token from the Google Sign-In SDK.
     """
 
     id_token: str = Field(..., description="Google ID token from client-side Google Sign-In SDK")
+
+
+class SendOTPResponse(BaseModel):
+    """Response for ``POST /auth/send-otp``.
+
+    ``dev_otp`` is populated only when ``OTP_ECHO_IN_RESPONSE`` is enabled, which
+    is the default in development and rejected in production. It exists so local
+    development does not need a working SMS provider.
+    """
+
+    message: str = Field(..., description="Human-readable outcome")
+    dev_otp: Optional[str] = Field(
+        None,
+        description=(
+            "The OTP itself. Present only when OTP_ECHO_IN_RESPONSE is enabled "
+            "(development only) — never populated in production."
+        ),
+    )
+
+
+class AadharSendOTPResponse(BaseModel):
+    """Response for ``POST /auth/aadhar/send-otp``.
+
+    An explicit allowlist. The route previously returned the KYC provider's
+    response dict verbatim with no response model, so anything the provider
+    chose to include was forwarded to the client — including the mock backend's
+    ``dev_otp``. An allowlist keeps that closed as providers change.
+    """
+
+    client_id: str = Field(..., description="Transaction ID, required to verify")
+    txn_id: Optional[str] = Field(None, description="Alias of client_id, provider-dependent")
+    message: str = Field(..., description="Human-readable outcome")
+    dev_otp: Optional[str] = Field(
+        None,
+        description=(
+            "The OTP itself. Present only when OTP_ECHO_IN_RESPONSE is enabled "
+            "and AADHAAR_BACKEND=console — never populated in production."
+        ),
+    )
 
 
 # ── Aadhaar auth ─────────────────────────────────────────────────────────────
@@ -230,20 +272,25 @@ class UpdateProfileRequest(BaseModel):
         name:         New display name.
         email:        Email address.
         language:     Preferred language — ``"en"`` (English), ``"hi"`` (Hindi), ``"gu"`` (Gujarati).
-        ward_id:      Ward UUID.
-        taluka_id:    Taluka UUID.
-        district_id:  District UUID.
+        ward_id:      Home ward UUID. **Citizens only** — for any other role this
+                      column is what determines administrative jurisdiction, so
+                      the endpoint rejects it with 403. Admin scope is assigned
+                      through ``POST``/``PUT /admin/admins``.
         fcm_token:    Firebase Cloud Messaging token for push notifications.
         phone:        Phone number (allows social-auth users to add phone later).
         ward:         Ward/area name (deprecated, use ward_id).
+
+    Note:
+        ``taluka_id`` and ``district_id`` are deliberately absent. They were
+        previously accepted here and written straight onto the caller, which let
+        any admin reassign themselves to any jurisdiction in the state with a
+        single request.
     """
 
     name: Optional[str] = Field(None, description="Display name")
     email: Optional[str] = Field(None, description="Email address")
     language: Optional[str] = Field(None, description="Preferred language: en, hi, or gu")
-    ward_id: Optional[UUID] = Field(None, description="Ward UUID")
-    taluka_id: Optional[UUID] = Field(None, description="Taluka UUID")
-    district_id: Optional[UUID] = Field(None, description="District UUID")
+    ward_id: Optional[UUID] = Field(None, description="Home ward UUID (citizens only)")
     fcm_token: Optional[str] = Field(None, description="Firebase Cloud Messaging token for push notifications")
     phone: Optional[str] = Field(None, description="Phone number (for social-auth users to add phone later)")
     ward: Optional[str] = Field(None, description="Ward/area name (deprecated, use ward_id)")
@@ -339,7 +386,12 @@ class RegisterRequest(BaseModel):
     phone: str = Field(..., examples=["+919876543210"], description="Phone number with country code")
     name: str = Field(..., min_length=2, description="Full display name")
     email: str = Field(..., examples=["user@example.com"], description="Email address")
-    password: str = Field(..., min_length=8, description="Password (minimum 8 characters)")
+    password: str = Field(
+        ...,
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=MAX_PASSWORD_LENGTH,
+        description=f"Password ({MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters)",
+    )
     confirm_password: str = Field(..., description="Must match password field")
 
     @field_validator("phone")
@@ -409,7 +461,12 @@ class ResetPasswordRequest(BaseModel):
 
     phone: str = Field(..., examples=["+919876543210"], description="Phone number that received the OTP")
     code: str = Field(..., examples=["123456"], description="6-digit OTP code")
-    new_password: str = Field(..., min_length=8, description="New password (minimum 8 characters)")
+    new_password: str = Field(
+        ...,
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=MAX_PASSWORD_LENGTH,
+        description=f"New password ({MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters)",
+    )
     confirm_password: str = Field(..., description="Must match new_password")
 
     @field_validator("phone")
@@ -456,7 +513,12 @@ class ChangePasswordRequest(BaseModel):
     current_password: Optional[str] = Field(
         None, description="Current password (skip for first-time workers)"
     )
-    new_password: str = Field(..., min_length=8, description="New password (minimum 8 characters)")
+    new_password: str = Field(
+        ...,
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=MAX_PASSWORD_LENGTH,
+        description=f"New password ({MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters)",
+    )
     confirm_password: str = Field(..., description="Must match new_password")
 
     @field_validator("confirm_password")

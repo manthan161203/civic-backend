@@ -75,6 +75,16 @@ class User(Base):
     # Password-based auth (nullable for OTP/OAuth-only users)
     password_hash = Column(String, nullable=True)
 
+    # Access tokens issued before this instant are rejected by get_current_user.
+    #
+    # Refresh tokens are revocable through the refresh_tokens table, but access
+    # tokens are stateless — nothing consulted that table on the request path, so
+    # "change my password because I've been compromised" left every stolen access
+    # token working until it expired. Bumping this to now() invalidates them all
+    # without needing a denylist store. Set on password change, password reset,
+    # and administrative deactivation.
+    tokens_valid_from = Column(DateTime(timezone=True), nullable=True)
+
     # Worker invitation tracking (pending workers who haven't changed password yet)
     must_change_password = Column(Boolean, default=False, nullable=False)
     invitation_sent_at = Column(DateTime(timezone=True), nullable=True, index=True)

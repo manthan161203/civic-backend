@@ -8,7 +8,9 @@ MEDIUM PRIORITY BUG FIX #4: Geofence intersection validation
 """
 
 import math
-from typing import Tuple, Optional
+
+# The one geofence size limit. Everything else derives from it.
+MAX_GEOFENCE_RADIUS_KM = 50.0
 
 
 EARTH_RADIUS_KM = 6371  # Earth's radius in kilometers
@@ -96,7 +98,14 @@ def validate_geofence_radius(radius_km: float) -> bool:
         ValueError: If radius is invalid with explanation
     """
     MIN_RADIUS_KM = 0.1
-    MAX_RADIUS_KM = 5000
+    # Single source of truth, imported by the schema validator too.
+    #
+    # There used to be three separate ceilings that disagreed: this one at
+    # 5000 km, an area cap of 5000 sq km (implying ~39.9 km of radius), and
+    # `le=100` on the Pydantic field. A 60 km zone passed two of them and was
+    # rejected by the third with a message about *area*, for a field the UI
+    # presents as a radius with a documented 100 km limit.
+    MAX_RADIUS_KM = MAX_GEOFENCE_RADIUS_KM
     
     if radius_km < MIN_RADIUS_KM:
         raise ValueError(f"Geofence radius must be at least {MIN_RADIUS_KM} km (100 meters)")
@@ -140,7 +149,9 @@ def validate_geofence_area(radius_km: float) -> bool:
     Raises:
         ValueError: If area exceeds maximum
     """
-    MAX_AREA_SQ_KM = 5000
+    # Derived from the radius cap rather than chosen independently, so the two
+    # checks can never disagree again.
+    MAX_AREA_SQ_KM = math.pi * (MAX_GEOFENCE_RADIUS_KM ** 2)
     area = calculate_geofence_area_sq_km(radius_km)
     
     if area > MAX_AREA_SQ_KM:

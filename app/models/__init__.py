@@ -1,4 +1,6 @@
+from app.models.admin_message import AdminMessage
 from app.models.admin_override import AdminOverride
+from app.models.admin_override_log import AdminOverrideLog
 from app.models.announcement import Announcement
 from app.models.custom_issue_type import CustomIssueType
 from app.models.dispute import Dispute
@@ -15,6 +17,7 @@ from app.models.otp import OTP
 from app.models.refresh_token import RefreshToken
 from app.models.reward import RewardTransaction, UserBadge
 from app.models.satisfaction_survey import SatisfactionSurvey
+from app.models.sync_action import SyncedAction
 from app.models.user import User
 from app.models.ward_subscription import WardSubscription
 from app.models.worker_complaint import WorkerComplaint
@@ -26,9 +29,12 @@ __all__ = [
     "Issue", "IssueComment", "IssueSquad", "IssueVote", "IssueFlag",
     "IssueBookmark", "CustomIssueType", "Dispute", "SatisfactionSurvey",
     "WorkerComplaint",
+    "SyncedAction",
     "Notification",
     "Announcement",
+    "AdminMessage",
     "AdminOverride",
+    "AdminOverrideLog",
     "Geofence",
     "WardSubscription",
     "WorkerShift",

@@ -13,7 +13,7 @@ Design:
 
 import uuid
 
-from sqlalchemy import Column, DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import Column, DateTime, Enum, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import relationship
 

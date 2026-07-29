@@ -10,9 +10,15 @@ flow or server-side OAuth is needed.
 Required config:
     ``GOOGLE_CLIENT_ID`` — Your Google OAuth2 client ID (from Google Cloud Console).
 
-DEV_MODE:
-    Token verification is bypassed. The ``id_token`` value is treated as a raw
-    ``google_id`` string, making it easy to test without real Google credentials.
+GOOGLE_AUTH_BACKEND="console":
+    Verification is bypassed and the ``id_token`` value is treated as a raw
+    ``google_id`` string, so local development does not need a real Google
+    project.
+
+    This is a COMPLETE AUTHENTICATION BYPASS — any string logs you in as the
+    corresponding account. It is rejected in production by
+    ``validate_settings()``, and must never be enabled anywhere reachable from
+    the internet.
 """
 
 from app.core.config import settings
@@ -24,11 +30,12 @@ logger = get_logger("google_auth")
 def verify_google_id_token(id_token: str) -> dict:
     """Verify a Google ID token and return the decoded user info.
 
-    In DEV_MODE, the token is treated as a mock ``google_id`` — no network
-    call is made, which allows easy local testing.
+    Verifies the token's signature against Google's public keys and checks the
+    ``aud`` claim matches ``GOOGLE_CLIENT_ID``.
 
-    In production, verifies the token's signature against Google's public keys
-    and checks the ``aud`` claim matches ``GOOGLE_CLIENT_ID``.
+    With ``GOOGLE_AUTH_BACKEND="console"`` the token is instead treated as a
+    mock ``google_id`` and no network call is made — see the module docstring
+    for why that must never reach production.
 
     Args:
         id_token: Google ID token obtained from the client-side Google Sign-In SDK.
@@ -43,8 +50,8 @@ def verify_google_id_token(id_token: str) -> dict:
     Raises:
         ValueError: If the token is invalid, expired, or the audience doesn't match.
     """
-    if settings.DEV_MODE:
-        logger.info(f"[DEV] Google auth — using mock google_id: {id_token}")
+    if settings.GOOGLE_AUTH_BACKEND == "console":
+        logger.warning(f"[console] Google auth bypass — mock google_id: {id_token}")
         return {
             "google_id": id_token,
             "email": f"{id_token}@mock.google.com",

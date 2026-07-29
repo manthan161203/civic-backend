@@ -11,37 +11,19 @@ ADMIN ROLES AUDIT - GAP #3: Cross-Admin Data Visibility Override
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Session
 
+from app.core.time import now_utc
 from app.core.logger import get_logger
-from app.database import Base
-from app.models import User, AdminOverride
+from app.models import AdminOverride, AdminOverrideLog, User
+
+# AdminOverrideLog moved to app/models/admin_override_log.py so it is registered
+# on Base.metadata. Re-exported here for existing importers.
 
 logger = get_logger(__name__)
-
-
-class AdminOverrideLog(Base):
-    """Audit log for admin override access to out-of-scope data."""
-    
-    __tablename__ = "admin_override_logs"
-    
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    admin_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-    admin_role = Column(String(50), nullable=False)  # The role of the admin performing override
-    target_scope = Column(String(255), nullable=False)  # e.g., "ward:123", "taluka:456"
-    reason = Column(String(500), nullable=False)  # Why they needed to access this data
-    accessed_resource_type = Column(String(50), nullable=False)  # "issue", "worker", "announcement", etc.
-    accessed_resource_id = Column(UUID(as_uuid=True), nullable=True)  # ID of the accessed resource
-    override_until = Column(DateTime(timezone=True), nullable=True)  # When override expires (if temporary)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
-    
-    def __repr__(self):
-        return f"<AdminOverrideLog {self.admin_id} -> {self.target_scope} at {self.created_at}>"
 
 
 def can_admin_override_access(
@@ -93,7 +75,7 @@ def can_admin_override_access(
             AdminOverride.target_scope_id == target_scope_id,
             AdminOverride.revoked_at.is_(None),  # Not revoked
             (AdminOverride.override_until.is_(None)) |  # Permanent or
-            (AdminOverride.override_until > datetime.utcnow())  # Not expired
+            (AdminOverride.override_until > now_utc())  # Not expired
         )
         .first()
     )
@@ -130,7 +112,7 @@ def log_override_access(
     
     override_until = None
     if duration_minutes:
-        override_until = datetime.utcnow() + timedelta(minutes=duration_minutes)
+        override_until = now_utc() + timedelta(minutes=duration_minutes)
     
     log = AdminOverrideLog(
         id=uuid.uuid4(),
@@ -166,7 +148,7 @@ def revoke_override(override_id: uuid.UUID, db: Session) -> None:
     """
     override_log = db.query(AdminOverrideLog).filter(AdminOverrideLog.id == override_id).first()
     if override_log:
-        override_log.override_until = datetime.utcnow()
+        override_log.override_until = now_utc()
         db.commit()
         logger.info(f"Admin override revoked: {override_id}", extra={"audit": True})
 
@@ -178,7 +160,7 @@ def get_active_overrides(admin_id: uuid.UUID, db: Session) -> list:
         .filter(
             AdminOverrideLog.admin_id == admin_id,
             (AdminOverrideLog.override_until.is_(None)) |
-            (AdminOverrideLog.override_until > datetime.utcnow())
+            (AdminOverrideLog.override_until > now_utc())
         )
         .order_by(AdminOverrideLog.created_at.desc())
         .all()
@@ -205,7 +187,7 @@ def get_override_log(
     if not db:
         return []
     
-    since = datetime.utcnow() - timedelta(days=days)
+    since = now_utc() - timedelta(days=days)
     query = db.query(AdminOverrideLog).filter(AdminOverrideLog.created_at >= since)
     
     if admin_id:

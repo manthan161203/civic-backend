@@ -11,16 +11,23 @@ from datetime import datetime, timezone
 from typing import Dict, Any
 
 from fastapi import APIRouter, Depends
+from fastapi import status as http_status
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
-from app.database import engine
+from app.core.deps import get_db, require_role
+from app.core.logger import get_logger
+from app.core.rate_limit import limiter
+from app.models.user import User
+
+logger = get_logger("health")
 
 router = APIRouter(prefix="/health", tags=["health"])
 
 
-@router.get("/ready", response_model=Dict[str, Any])
+@router.get("/ready")
+@limiter.exempt
 async def health_ready(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     Readiness probe for Kubernetes/Docker orchestration.
@@ -38,24 +45,30 @@ async def health_ready(db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
         # Test database connectivity
         db.execute(text("SELECT 1"))
-        db_status = "connected"
     except Exception:
-        db_status = "disconnected"
-        return {
-            "status": "not_ready",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "database": db_status,
-            "detail": "Database unavailable"
-        }
-    
+        # Must be a 503. This previously returned HTTP 200 with a body saying
+        # "not_ready", which every orchestrator reads as ready — the probe was
+        # decorative. Note SessionLocal() does not connect eagerly, so the
+        # get_db dependency yields fine and the failure only surfaces here.
+        return JSONResponse(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "not_ready",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "database": "disconnected",
+                "detail": "Database unavailable",
+            },
+        )
+
     return {
         "status": "ready",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "database": db_status
+        "database": "connected",
     }
 
 
 @router.get("/live", response_model=Dict[str, Any])
+@limiter.exempt
 async def health_live() -> Dict[str, Any]:
     """
     Liveness probe for Kubernetes/Docker orchestration.
@@ -76,16 +89,27 @@ async def health_live() -> Dict[str, Any]:
 
 
 @router.get("/integrity", response_model=Dict[str, Any])
-async def health_integrity(db: Session = Depends(get_db)) -> Dict[str, Any]:
+async def health_integrity(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_role("admin")),
+) -> Dict[str, Any]:
     """
-    Detailed integrity check - verifies database consistency.
-    
+    Detailed integrity check - verifies database consistency. **Roles**: super-admin.
+
+    Not a probe. Unlike ``/health/live`` and ``/health/ready`` this runs four
+    full table scans, so it is authenticated and rate-limited: it was previously
+    open to the internet with ``@limiter.exempt``, which let anyone saturate the
+    database by looping it. It also returned raw ``str(e)`` from SQLAlchemy —
+    connection parameters, table names and SQL fragments — to whoever called it.
+    Failures are now logged with the detail and reported to the caller as a
+    fixed string.
+
     Runs checks on:
     - Database connection
     - Key table accessibility
     - Orphaned records
     - Soft-delete consistency
-    
+
     Response:
         {
             "status": "healthy" | "degraded",
@@ -106,7 +130,8 @@ async def health_integrity(db: Session = Depends(get_db)) -> Dict[str, Any]:
     except Exception as e:
         db_connected = False
         checks_failed += 1
-        issues.append(f"Database connection failed: {str(e)}")
+        logger.error("Integrity check: database connection failed: %s", e, exc_info=True)
+        issues.append("Database connection failed")
     
     if not db_connected:
         return {
@@ -125,17 +150,19 @@ async def health_integrity(db: Session = Depends(get_db)) -> Dict[str, Any]:
     # Check table accessibility
     tables_ok = True
     try:
-        from app.models import User, Issue, Geofence
+        from app.models import User, Issue
         
-        # Quick count queries to verify tables exist and are accessible
-        user_count = db.query(User).count()
-        issue_count = db.query(Issue).count()
+        # The queries themselves are the check — they raise if the table is
+        # missing or unreadable. The counts are not needed.
+        db.query(User).count()
+        db.query(Issue).count()
         
         checks_passed += 1
     except Exception as e:
         tables_ok = False
         checks_failed += 1
-        issues.append(f"Table accessibility check failed: {str(e)}")
+        logger.error("Integrity check: table accessibility failed: %s", e, exc_info=True)
+        issues.append("Table accessibility check failed")
     
     # Check for orphaned issues (assigned to non-existent workers)
     if tables_ok:
@@ -155,7 +182,8 @@ async def health_integrity(db: Session = Depends(get_db)) -> Dict[str, Any]:
                 
         except Exception as e:
             checks_failed += 1
-            issues.append(f"Orphan check failed: {str(e)}")
+            logger.error("Integrity check: orphan check failed: %s", e, exc_info=True)
+            issues.append("Orphan check failed")
     
     # Check soft-delete consistency
     if tables_ok:
@@ -176,7 +204,8 @@ async def health_integrity(db: Session = Depends(get_db)) -> Dict[str, Any]:
                 
         except Exception as e:
             checks_failed += 1
-            issues.append(f"Soft-delete check failed: {str(e)}")
+            logger.error("Integrity check: soft-delete check failed: %s", e, exc_info=True)
+            issues.append("Soft-delete check failed")
     
     status = "healthy" if checks_failed == 0 else ("degraded" if issues else "unhealthy")
     
@@ -194,6 +223,7 @@ async def health_integrity(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 
 @router.get("/", response_model=Dict[str, Any])
+@limiter.exempt
 async def health_overall(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     Overall health status - combines all checks.

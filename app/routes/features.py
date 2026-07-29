@@ -23,7 +23,6 @@ Public:
 """
 
 import uuid
-from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -32,7 +31,8 @@ from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user, require_min_role, require_role
+from app.core.time import now_utc
+from app.core.deps import get_current_user, require_role
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.announcement import Announcement
@@ -92,10 +92,17 @@ def upvote_issue(
 
     logger.info(f"User {current_user.id} upvoted issue {issue_id} (total={issue.upvote_count})")
 
-    # Reward the issue reporter for receiving a vote
+    # Reward the issue reporter for receiving a vote.
+    #
+    # Keyed on the vote, not the issue. With reference_id=issue.id the
+    # idempotency check treated votes 2..N on the same issue as duplicates of
+    # vote 1, so an issue with 200 upvotes earned its reporter 5 points — once.
+    # That also made the `community_voice` badge unreachable as documented:
+    # "50+ upvotes total" is gated on 250 points of vote_received, which at a
+    # hard cap of 5 points per issue needs 50 separate issues, not 50 votes.
     try:
         from app.services.rewards_service import award_event
-        award_event(db, issue.reporter_id, "vote_received", reference_id=issue.id,
+        award_event(db, issue.reporter_id, "vote_received", reference_id=vote.id,
                     note=f"Issue received an upvote (total={issue.upvote_count})")
     except Exception as e:
         logger.error(f"Failed to reward vote: {e}")
@@ -110,7 +117,7 @@ def upvote_issue(
         try:
             from app.services.notification_service import notify_localized
             issue.is_escalated = True
-            issue.escalated_at = datetime.utcnow()
+            issue.escalated_at = now_utc()
             db.commit()
             admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()
             
@@ -168,8 +175,14 @@ def remove_upvote(
     issue = db.query(Issue).filter(Issue.id == issue_id).first()
     try:
         db.delete(vote)
-        if issue and issue.upvote_count and issue.upvote_count > 0:
-            issue.upvote_count -= 1
+        # Atomic SQL-level decrement, matching the increment in upvote_issue.
+        # This was a read-modify-write: two users removing votes concurrently
+        # both read the same count and both wrote count-1, losing a decrement.
+        # The counter then drifts permanently away from COUNT(issue_votes) and
+        # drives both the escalation threshold and the "trending" sort.
+        db.query(Issue).filter(Issue.id == issue_id, Issue.upvote_count > 0).update(
+            {"upvote_count": Issue.upvote_count - 1}
+        )
         db.commit()
     except Exception as e:
         db.rollback()
@@ -611,8 +624,13 @@ def list_public_announcements(
             
             if ward_id and ward_id != citizen_ward_id:
                 # Check if citizen is subscribed to this ward
+                # WardSubscription's column is user_id. `citizen_id` does not
+                # exist, so this raised AttributeError — which the bare
+                # `except Exception` below turned into a 500. The access control
+                # "worked" only by accident, with the wrong status code and an
+                # ERROR-level log line for every legitimate denial.
                 is_subscribed = db.query(WardSubscription).filter(
-                    WardSubscription.citizen_id == current_user.id,
+                    WardSubscription.user_id == current_user.id,
                     WardSubscription.ward_id == ward_id
                 ).first()
                 if not is_subscribed:
@@ -633,7 +651,7 @@ def list_public_announcements(
                     detail="Citizens can only view ward-level announcements"
                 )
         
-        now = datetime.utcnow()
+        now = now_utc()
         base = db.query(Announcement).filter(
             (Announcement.expires_at.is_(None)) | (Announcement.expires_at > now)
         )
@@ -653,6 +671,12 @@ def list_public_announcements(
         total = query.count()
         items = query.order_by(Announcement.created_at.desc())
         items = apply_pagination(items, page, size).all()
+    except HTTPException:
+        # Let the three deliberate 403s above through. Without this they were
+        # caught by the handler below and re-raised as 500 "Failed to fetch
+        # announcements", so a client that was correctly denied could not tell
+        # a permission decision from a server fault.
+        raise
     except Exception as e:
         logger.error(f"Error listing public announcements: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch announcements.")

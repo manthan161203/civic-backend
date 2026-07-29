@@ -13,13 +13,13 @@ Hierarchy:
 
 import math
 import uuid
-from typing import List, Optional
+from typing import Optional
 
 import requests as http_requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user, require_role, require_any_admin
+from app.core.deps import require_role
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.location import District, Taluka, Ward
@@ -48,8 +48,15 @@ def _geocode(query: str) -> tuple[float, float] | None:
         results = resp.json()
         if results:
             return float(results[0]["lat"]), float(results[0]["lon"])
-    except Exception:
-        pass
+        logger.warning("Geocoding found no match for %r", query)
+    except Exception as e:
+        # Was `except Exception: pass`. A geocode failure leaves the centroid
+        # NULL, which silently breaks distance-based worker routing for that
+        # ward — and produced no log line at all, so the first symptom was
+        # "auto-assignment stopped working in one ward" with nothing to go on.
+        # Still non-fatal: a location without a centroid is better than a
+        # failed create, and scripts/seed_locations.py supplies real centroids.
+        logger.warning("Geocoding failed for %r: %s", query, e)
     return None
 
 

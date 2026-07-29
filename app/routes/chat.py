@@ -9,7 +9,6 @@ Frontend Integration Notes:
 - The chat is stateless (no conversation history) — each request is independent.
 """
 
-from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -17,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.time import now_utc
 from app.core.deps import get_current_user
 from app.core.logger import get_logger
 from app.database import get_db
@@ -93,7 +93,7 @@ def civic_chat(
         # admin: no restriction
         issue = q.first()
         if issue:
-            time_since_report = (datetime.utcnow() - issue.created_at).days
+            time_since_report = (now_utc() - issue.created_at).days
             context += (
                 f"\n--- ISSUE BEING DISCUSSED ---\n"
                 f"Issue ID: {issue.id}\n"
@@ -110,8 +110,12 @@ def civic_chat(
                 f"Reported at: {issue.created_at.strftime('%d %b %Y, %I:%M %p')}\n"
                 f"Resolved at: {issue.resolved_at.strftime('%d %b %Y, %I:%M %p') if issue.resolved_at else 'Not yet resolved'}\n"
                 f"Resolution Notes: {issue.resolution_notes or 'None'}\n"
-                f"Has Before Photo: {'Yes' if issue.before_photo_url else 'No'}\n"
-                f"Has After Photo: {'Yes' if issue.after_photo_url else 'No'}"
+                # before_photos / after_photos — the singular *_photo_url
+                # attributes referenced here do not exist on Issue, so every
+                # /chat request carrying an issue_id raised AttributeError.
+                # This sits outside the try below, so it escaped as a 500.
+                f"Has Before Photo: {'Yes' if issue.before_photos else 'No'}\n"
+                f"Has After Photo: {'Yes' if issue.after_photos else 'No'}"
             )
 
     # Build additional dynamic context from database based on user intent

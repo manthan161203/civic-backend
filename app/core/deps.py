@@ -14,9 +14,11 @@ Usage in route functions:
     current_user: User = Depends(require_min_role("ward_admin")) # ward_admin or above
 """
 
+from datetime import datetime, timezone
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import false as sql_false, select
 from sqlalchemy.orm import Session
 
 from app.core.logger import get_logger
@@ -66,6 +68,20 @@ def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
+
+    # Access tokens are stateless, so revoking a refresh token does nothing to
+    # them. `tokens_valid_from` is bumped whenever the user's credentials change
+    # or an admin deactivates them, which retires every token issued before that
+    # instant. Tokens minted before this field existed carry no `iat`; treat a
+    # missing `iat` as "older than any cutoff" rather than trusting it.
+    if user.tokens_valid_from is not None:
+        issued_at = payload.get("iat")
+        if issued_at is None or datetime.fromtimestamp(issued_at, tz=timezone.utc) < user.tokens_valid_from:
+            logger.warning(f"Token rejected: issued before credential cutoff for user {user_id}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired, please sign in again",
+            )
 
     return user
 
@@ -144,13 +160,27 @@ def require_min_role(min_role: str):
     return _check
 
 
+# Sentinel key meaning "this admin has a scoped role but no scope assigned, so
+# they may see nothing". Distinct from {} , which means "unrestricted".
+DENY_ALL = "__deny_all__"
+
+SCOPED_ADMIN_ROLES = ("district_admin", "taluka_admin", "ward_admin")
+
+
 def get_admin_scope_filter(admin_user: User) -> dict:
     """Return a dict of Issue field filters matching the admin's geographic scope.
 
     Returns:
         Dict suitable for use with SQLAlchemy filter kwargs, e.g.
         ``{"ward_id": uuid}``  for a ward_admin,
-        ``{}``                 for a super-admin (no filter = see everything).
+        ``{}``                 for a super-admin (no filter = see everything),
+        ``{DENY_ALL: True}``   for a scoped admin with no scope assigned.
+
+    The last case used to return ``{}`` as well — the same value that means
+    *unrestricted*. So a ward_admin whose ``ward_id`` was never set did not get a
+    narrowed view, they got every issue in the system. Since a fresh database has
+    no location hierarchy at all, that was the default state for any admin
+    created before the wards were seeded. Fail closed instead.
     """
     if admin_user.role == "admin":
         return {}
@@ -160,6 +190,13 @@ def get_admin_scope_filter(admin_user: User) -> dict:
         return {"taluka_id": admin_user.taluka_id}
     if admin_user.role == "ward_admin" and admin_user.ward_id:
         return {"ward_id": admin_user.ward_id}
+    if admin_user.role in SCOPED_ADMIN_ROLES:
+        logger.error(
+            "Admin %s has role %s but no scope assigned — denying all scoped access",
+            admin_user.id,
+            admin_user.role,
+        )
+        return {DENY_ALL: True}
     return {}
 
 
@@ -181,6 +218,8 @@ def apply_admin_scope(query, admin_user: User, model):
     scope = get_admin_scope_filter(admin_user)
     if not scope:
         return query
+    if scope.get(DENY_ALL):
+        return query.filter(sql_false())
 
     if "ward_id" in scope:
         query = query.filter(model.ward_id == scope["ward_id"])
@@ -204,3 +243,32 @@ def apply_admin_scope(query, admin_user: User, model):
             ).scalar_subquery()
             query = query.filter(model.ward_id.in_(ward_ids))
     return query
+
+
+def user_scope_filter(admin_user: User) -> list:
+    """Build SQLAlchemy filter conditions for User queries based on admin scope.
+
+    Returns an empty list only for the super-admin, who is genuinely
+    unrestricted. A scoped admin role whose scope column is NULL gets a filter
+    that matches nothing.
+
+    That last case used to return ``[]`` as well, which callers apply as "no
+    filter" — so a ward_admin whose ``ward_id`` had never been set did not get a
+    narrower view of the system, they got the *whole* system. Fail closed.
+    """
+    if admin_user.role == "admin":
+        return []
+    if admin_user.role == "district_admin" and admin_user.district_id:
+        return [User.district_id == admin_user.district_id]
+    if admin_user.role == "taluka_admin" and admin_user.taluka_id:
+        return [User.taluka_id == admin_user.taluka_id]
+    if admin_user.role == "ward_admin" and admin_user.ward_id:
+        return [User.ward_id == admin_user.ward_id]
+    if admin_user.role in ("district_admin", "taluka_admin", "ward_admin"):
+        logger.error(
+            "Admin %s has role %s but no scope assigned — denying all scoped access",
+            admin_user.id,
+            admin_user.role,
+        )
+        return [sql_false()]
+    return []

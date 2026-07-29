@@ -9,12 +9,12 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user, require_any_admin, require_role
+from app.core.time import now_utc
+from app.core.deps import ADMIN_ROLES, apply_admin_scope, get_current_user, require_any_admin, require_role
 from app.core.logger import get_logger
 from app.database import get_db
 from app.models.dispute import Dispute
@@ -23,7 +23,8 @@ from app.models.issue_bookmark import IssueBookmark
 from app.models.satisfaction_survey import SatisfactionSurvey
 from app.models.user import User
 from app.services.notification_service import notify_localized
-from app.services.storage import upload_image
+from app.core.exceptions import CivicException
+from app.services.storage import upload_image_or_raise
 from app.services.utils import get_issue_or_404
 
 logger = get_logger("citizen_features")
@@ -93,6 +94,20 @@ class CustomIssueTypeResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+def _scoped_issue_ids(current_user: User, db: Session):
+    """Issue IDs this admin may act on, or None for an unrestricted super-admin.
+
+    Disputes and surveys are not geographic themselves but hang off an issue
+    that is. Filtering on this gives them the same jurisdiction boundary the
+    issue list already has — they previously had none at all, so a single-ward
+    admin could read every citizen's survey feedback in the state and resolve
+    any dispute anywhere.
+    """
+    if current_user.role == "admin":
+        return None
+    return apply_admin_scope(db.query(Issue.id), current_user, Issue).scalar_subquery()
 
 
 # ── Disputes (#1) ────────────────────────────────────────────────────────────
@@ -202,14 +217,18 @@ async def upload_dispute_photos(
             if len(file_bytes) > 10 * 1024 * 1024:
                 raise HTTPException(status_code=400, detail="File too large. Max 10 MB.")
             filename = f"dispute_{uuid.uuid4().hex[:8]}"
-            url = upload_image(file_bytes, filename, user_id=str(current_user.id), issue_id=str(issue_id))
-            if url:
-                uploaded_urls.append(url)
+            url = upload_image_or_raise(
+                file_bytes, filename, user_id=str(current_user.id), issue_id=str(issue_id)
+            )
+            uploaded_urls.append(url)
 
         dispute.photos = (dispute.photos or []) + uploaded_urls
         db.commit()
         db.refresh(dispute)
-    except HTTPException:
+    except (HTTPException, CivicException):
+        # CivicException carries its own status (503 for a storage outage) and
+        # is rendered by the handler in main.py — do not flatten it to a 500.
+        db.rollback()
         raise
     except Exception as e:
         db.rollback()
@@ -252,7 +271,11 @@ def resolve_dispute(
     if body.outcome not in ("accepted", "rejected"):
         raise HTTPException(status_code=400, detail="outcome must be 'accepted' or 'rejected'")
 
-    dispute = db.query(Dispute).filter(Dispute.id == dispute_id).first()
+    dispute_q = db.query(Dispute).filter(Dispute.id == dispute_id)
+    allowed = _scoped_issue_ids(current_user, db)
+    if allowed is not None:
+        dispute_q = dispute_q.filter(Dispute.issue_id.in_(allowed))
+    dispute = dispute_q.first()
     if not dispute:
         raise HTTPException(status_code=404, detail="Dispute not found")
 
@@ -302,8 +325,11 @@ def list_disputes(
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """List all disputes for admin review with pagination."""
+    """List disputes for admin review, scoped to the admin's jurisdiction."""
     query = db.query(Dispute)
+    allowed = _scoped_issue_ids(current_user, db)
+    if allowed is not None:
+        query = query.filter(Dispute.issue_id.in_(allowed))
     if status_filter:
         query = query.filter(Dispute.status == status_filter)
     
@@ -376,10 +402,42 @@ def get_survey(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get the satisfaction survey for an issue (if submitted)."""
+    """Get the satisfaction survey for an issue (if submitted).
+
+    **Roles**: the citizen who reported the issue, the worker who resolved it,
+    and admins within whose jurisdiction the issue falls.
+
+    Surveys carry a numeric rating and free-text feedback about a named worker.
+    This endpoint had no ownership check at all — only ``get_current_user`` —
+    so any citizen who could guess or enumerate an issue UUID could read every
+    other citizen's rating and comments.
+    """
     survey = db.query(SatisfactionSurvey).filter(SatisfactionSurvey.issue_id == issue_id).first()
     if not survey:
         raise HTTPException(status_code=404, detail="No survey found for this issue")
+
+    issue = db.query(Issue).filter(Issue.id == issue_id).first()
+    if not issue:
+        raise HTTPException(status_code=404, detail="No survey found for this issue")
+
+    if current_user.role == "citizen":
+        allowed = issue.reporter_id == current_user.id
+    elif current_user.role == "worker":
+        allowed = issue.assigned_worker_id == current_user.id
+    elif current_user.role in ADMIN_ROLES:
+        allowed = bool(
+            apply_admin_scope(
+                db.query(Issue.id).filter(Issue.id == issue_id), current_user, Issue
+            ).first()
+        )
+    else:
+        allowed = False
+
+    if not allowed:
+        # 404 rather than 403: confirming a survey exists for someone else's
+        # issue is itself the leak this endpoint had.
+        raise HTTPException(status_code=404, detail="No survey found for this issue")
+
     return SurveyResponse.model_validate(survey)
 
 
@@ -413,15 +471,18 @@ def survey_stats(
     **Roles**: any admin.
     """
     from datetime import timedelta
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = now_utc() - timedelta(days=days)
 
     try:
-        surveys = (
-            db.query(SatisfactionSurvey)
-            .filter(SatisfactionSurvey.created_at >= cutoff)
-            .order_by(SatisfactionSurvey.created_at.desc())
-            .all()
+        survey_q = db.query(SatisfactionSurvey).filter(
+            SatisfactionSurvey.created_at >= cutoff
         )
+        # Surveys carry free-text feedback and the reporting citizen's id. This
+        # returned every one in the system to any admin role.
+        allowed = _scoped_issue_ids(current_user, db)
+        if allowed is not None:
+            survey_q = survey_q.filter(SatisfactionSurvey.issue_id.in_(allowed))
+        surveys = survey_q.order_by(SatisfactionSurvey.created_at.desc()).all()
         total = len(surveys)
         if total == 0:
             return {
@@ -493,7 +554,8 @@ def bookmark_issue(
     db: Session = Depends(get_db),
 ):
     """Bookmark an issue to receive status updates."""
-    issue = get_issue_or_404(issue_id, db)
+    # Called for the 404 it raises, not for the object.
+    get_issue_or_404(issue_id, db)
 
     existing = db.query(IssueBookmark).filter(
         IssueBookmark.issue_id == issue_id,
@@ -556,7 +618,10 @@ def get_bookmarks(
 
 @router.get("/admin/custom-issue-types", response_model=List[CustomIssueTypeResponse])
 def list_custom_issue_types(
-    status: str = Query(None),
+    # Named status_filter, not status: a parameter called `status` shadows the
+    # module-level `from fastapi import status`, so any HTTPException in this
+    # handler using status.HTTP_* would raise AttributeError on a string.
+    status_filter: Optional[str] = Query(None, alias="status"),
     approved_only: bool = Query(False),
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
@@ -572,15 +637,29 @@ def list_custom_issue_types(
     from app.models.custom_issue_type import CustomIssueType
     query = db.query(CustomIssueType)
     
-    # Handle status filter
-    if status:
-        if status == 'approved':
-            query = query.filter(CustomIssueType.is_approved == True)
-        elif status == 'pending':
-            query = query.filter(CustomIssueType.is_approved == False)
-        elif status == 'rejected':
-            # For now, treat rejected same as pending (no explicit rejected field)
-            query = query.filter(CustomIssueType.is_approved == False)
+    # Handle status filter.
+    #
+    # 'rejected' is refused rather than silently answered. The model has only
+    # `is_approved`, with no way to distinguish "not yet reviewed" from
+    # "reviewed and turned down" — so this used to map 'rejected' onto the same
+    # predicate as 'pending' and return a list of pending types labelled as
+    # rejections. Returning the wrong data is worse than saying no.
+    if status_filter:
+        if status_filter == 'approved':
+            query = query.filter(CustomIssueType.is_approved == True)  # noqa: E712
+        elif status_filter == 'pending':
+            query = query.filter(CustomIssueType.is_approved == False)  # noqa: E712
+        elif status_filter == 'rejected':
+            raise HTTPException(
+                status_code=400,
+                detail="Rejection is not tracked separately from pending. "
+                       "Use status=pending.",
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="status must be one of: approved, pending",
+            )
     
     # Legacy support
     if approved_only:

@@ -9,7 +9,7 @@ Production-ready FastAPI backend for the **Civic Issue Reporting** platform — 
 | Layer | Technology |
 |---|---|
 | API Framework | FastAPI (async) |
-| Database | PostgreSQL via Supabase |
+| Database | PostgreSQL 16 (Docker) |
 | ORM | SQLAlchemy |
 | Migrations | Alembic |
 | Image Storage | Cloudinary |
@@ -87,46 +87,100 @@ civic-backend/
 
 ## Quick Start
 
-### Option A — Local (venv)
+Everything runs in Docker — Postgres included. There is no external database to
+provision.
 
 ```bash
-# 1. Clone and create virtualenv
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Configure environment
+# 1. Configure environment
 cp .env.example .env
-# Fill in your values (see Environment Variables below)
+# Set a real secret:
+sed -i "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" .env
 
-# 4. Run database migrations
-alembic upgrade head
-
-# 5a. Start dev server (auto-picks a free port, reloads on .py + .env changes)
-python run.py
-
-# 5b. Or specify a port
-python run.py 8080
+# 2. Start the stack
+docker compose up -d api
 ```
 
-### Option B — Docker
+That single command brings up everything in order: `db` starts and becomes
+healthy, `migrate` runs `alembic upgrade head` once and exits, then `api`
+starts. Compose handles the sequencing via `depends_on`.
+
+| Service   | What it is                          | Notes                                                  |
+|-----------|-------------------------------------|--------------------------------------------------------|
+| `db`      | PostgreSQL 16                       | Published on `127.0.0.1:5434` for psql/GUI access       |
+| `migrate` | One-shot `alembic upgrade head`     | Runs to completion before `api` starts                  |
+| `api`     | uvicorn, 2 workers                  | `http://localhost:8000`                                 |
+| `jobs`    | Scheduled background work           | Exactly one replica — see below                         |
+| `api-dev` | uvicorn `--reload`, source mounted  | Profile `dev`, `http://localhost:8001`                  |
+
+### Why `jobs` is a separate service
+
+The hourly escalation cycle and the pool monitor are started by the application
+startup hook, which runs **once per uvicorn worker process**. Running them in
+the API meant `--workers 2` executed the cycle twice concurrently: duplicate
+escalations, duplicate notifications, and the weekly streak bonus granted twice.
+That is data corruption, not noise — which is why the API was pinned to a single
+worker.
+
+They now run in [app/jobs.py](app/jobs.py) as their own service, with
+`RUN_BACKGROUND_JOBS=false` on the API, so API workers scale freely. The cycle
+additionally takes a Postgres advisory lock, so even a misconfiguration that
+starts two runners cannot double-process.
+
+### Seeding the location hierarchy
+
+A fresh database has no districts, talukas or wards. Citizens can still report
+issues (`ward_id` is optional), but hierarchy-scoped admins cannot work without
+it: `get_admin_scope_filter` returns an *empty* filter for a `ward_admin` with a
+NULL `ward_id`, which silently widens their view to every issue instead of
+narrowing it.
 
 ```bash
-# Build and start (auto-reload enabled via volume mount)
-docker compose up --build
-
-# Custom port
-PORT=9000 docker compose up
-
-# Production build (no reload, 2 workers)
-docker build -t civic-api .
-docker run --env-file .env -p 8000:8000 civic-api
+docker compose run --rm api python scripts/seed_locations.py --dry-run
+docker compose run --rm api python scripts/seed_locations.py
 ```
 
-Server starts at `http://0.0.0.0:<port>`
-Interactive docs at `http://localhost:<port>/docs`
+Reads [scripts/locations_gujarat.csv](scripts/locations_gujarat.csv) and is
+idempotent, so extend the CSV and re-run. Centroids come from the file rather
+than the admin API's live Nominatim lookups — a rate-limited public geocoder
+that needs outbound internet has no business in a bootstrap path, and a failed
+lookup leaves the centroid NULL, which breaks distance-based worker routing.
+
+```bash
+# Auto-reloading dev server instead (source is bind-mounted)
+docker compose up api-dev
+
+# Follow logs / check status
+docker compose logs -f api
+docker compose ps
+
+# psql into the database
+docker compose exec db psql -U civic -d civic
+
+# Re-run migrations after adding a revision
+docker compose up migrate
+
+# Stop (volumes persist) / wipe everything including data
+docker compose down
+docker compose down -v
+```
+
+Server at `http://localhost:8000`, interactive docs at `http://localhost:8000/docs`
+(docs are served only while `DEV_MODE=true`).
+
+Ports, credentials and the host UID are all configurable in `.env` — see
+`PORT`, `DEV_PORT`, `DB_PORT`, `POSTGRES_*`, `UID`/`GID`.
+
+### Running without Docker
+
+Supported but not the primary path. You need Python 3.13 and a PostgreSQL 13+
+server of your own; point `DATABASE_URL` at it, then:
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+alembic upgrade head
+python run.py 8000
+```
 
 ### First-Time Setup (Bootstrap Admin)
 
@@ -162,20 +216,175 @@ Once any admin account exists, `POST /setup/admin` returns `403 Setup already co
 
 ---
 
+## Environments and Configuration
+
+`ENVIRONMENT` (`development` | `production`) is the gate. It does two things:
+it sets the **default** for every switch below, and it decides whether a bad
+configuration is a **warning** or a **refusal to start**.
+
+Startup validation (`validate_settings()` in [app/core/config.py](app/core/config.py))
+runs in both environments and collects *every* problem before reporting, so a
+broken production config can be fixed in one pass rather than one redeploy per
+mistake. In development the problems are logged as warnings, so you can see
+exactly what production would reject without being blocked. The `migrate`
+service validates too, so a bad config fails there before the API even starts.
+
+### Integration backends
+
+Each integration is either the real provider or `console`, which logs what
+*would* have been sent. `console` is rejected in production.
+
+| Setting | Real | Mock |
+|---|---|---|
+| `SMS_BACKEND` | `msg91` | `console` |
+| `EMAIL_BACKEND` | `smtp` | `console` |
+| `PUSH_BACKEND` | `fcm` | `console` |
+| `AADHAAR_BACKEND` | `surepass` / `idfy` | `console` |
+| `GOOGLE_AUTH_BACKEND` | `google` | `console` |
+
+> `GOOGLE_AUTH_BACKEND=console` accepts **any string** as a valid Google ID
+> token. It is a complete authentication bypass and exists only so local
+> development does not need a real Google project.
+
+### Exposure switches
+
+Leave unset to follow `ENVIRONMENT` — on in development, off in production.
+An unset switch is deliberately distinguishable from an explicit `false`.
+
+- `DOCS_ENABLED` — `/docs` and `/redoc`
+- `OTP_ECHO_IN_RESPONSE` — returns the login OTP in the send-OTP response body
+- `POOL_HEALTH_ENDPOINT_ENABLED` — `/health/pool`
+
+### Photo storage
+
+`STORAGE_BACKEND=local` writes to the `uploads_data` Docker volume and serves it
+at `/uploads`. That mount is gated on the **storage backend**, not on the
+environment — it is the backend that decides whether the files exist on disk.
+
+Stored URLs are **absolute**, built from `PUBLIC_BASE_URL`. A root-relative path
+only resolves for clients served from the same origin as the API, which is not
+true of the mobile app. Because the URL is persisted in the database, changing
+`PUBLIC_BASE_URL` later does not rewrite existing rows — set it to the origin
+clients actually use before anything but curl talks to the API.
+
+Upload failures are **loud**: `upload_image_or_raise()` raises a 503 rather than
+returning `None`. Handing a citizen a 200 after discarding their photo gives
+them no reason to retry, and the image is gone. Two consequences worth knowing:
+a storage outage blocks workers from marking issues resolved (the after-photo is
+the proof-of-work artifact and feeds the AI resolution check), and a failed
+profile-photo upload leaves the existing photo in place rather than nulling it.
+
+### Integrations fail loudly
+
+An unconfigured integration reports failure — it never reports success. This
+used to be inverted: with `SMS_BACKEND=msg91` and no API key, `/auth/send-otp`
+answered `200 "OTP sent successfully"` while sending nothing, so every user was
+locked out with no error surfaced anywhere. Same for SMTP.
+
+| Situation | Result |
+|---|---|
+| MSG91 selected, no credentials | `send_otp` returns False → **503** |
+| SMTP selected, no `SMTP_HOST` | invitation returns False → password returned to the admin |
+| Firebase credentials missing | push returns False; the notification row is still written |
+| Aadhaar KYC selected, no URL/key | **503** on both send *and* verify |
+
+### Worker invitations
+
+`POST /admin/workers` generates a temporary password, stores only its hash, and
+emails it. If the email is not delivered — including when `EMAIL_BACKEND=console`
+— the password is returned in the response to the calling admin, who must relay
+it. It is never written to the log: log files are kept for 30 days and the
+Sentry logging integration ships INFO records as breadcrumbs, so a logged
+password outlives and outruns the email it came from.
+
+`POST /admin/workers/{id}/resend-invitation` rotates the password and re-sends.
+Without it, a failed delivery left the account permanently unusable — only the
+hash is stored, and the escalation job deactivates the worker after 7 days.
+
+### Rate limiting
+
+One shared `Limiter` lives in [app/core/rate_limit.py](app/core/rate_limit.py).
+`RATE_LIMIT_PER_MINUTE` (default 60/min per IP) applies to every route via
+`SlowAPIMiddleware`; the auth routes add tighter per-route limits on top. Health
+endpoints are exempt so probes don't consume a caller's budget.
+
+This previously did nothing at all. Two `Limiter` instances existed — one in
+`main.py` holding `default_limits`, one in `auth.py` that the decorators used —
+and `SlowAPIMiddleware` was never added, so `default_limits` was never enforced
+and every route outside `auth` was unthrottled.
+
+Counters are in-memory and therefore per process: with N uvicorn workers the
+effective limit is N times what you configure. That's another reason the API
+runs a single worker.
+
+### Logging
+
+Driven by `LOG_LEVEL`, `LOG_FORMAT`, `LOG_TO_FILE` and `LOG_DIR`, all defaulting
+from `ENVIRONMENT`: DEBUG/text/file-on in development, INFO/json/**file-off** in
+production. In a container stdout is the log.
+
+`LOG_LEVEL=DEBUG` is rejected in production — debug records include OTPs, files
+are kept 30 days, and the Sentry logging integration forwards INFO records as
+breadcrumbs. The log directory is also no longer created at import time, which
+used to abort startup with a `PermissionError` when the working directory wasn't
+writable by the container user.
+
+### Bootstrap security
+
+`POST /setup/admin` is unauthenticated by design — it has to be, since no
+account exists yet. Two things narrow that window:
+
+- The lock is **existence** of an admin, not an *active* admin. It used to
+  require `is_active == True`, so deactivating the sole admin silently re-opened
+  an endpoint that mints a new super-admin.
+- In production it additionally requires an `X-Setup-Token` header matching
+  `SETUP_TOKEN` (compared with `secrets.compare_digest`). Without the token set,
+  the endpoint refuses outright rather than running unauthenticated.
+
+### What production refuses to start without
+
+A weak, short, or placeholder `SECRET_KEY`; `DEV_MODE=true`; any backend set to
+`console`; `OTP_ECHO_IN_RESPONSE=true`; `CORS_ORIGINS=*` or any non-https
+origin; a `DEBUG` log level; missing MSG91 credentials (phone OTP is the only
+login path that works for every role — without it *nobody* can log in); missing
+SMTP credentials (worker invitations are the only way to onboard a worker); a
+missing Firebase credentials file; and, with `STORAGE_BACKEND=local`, a
+`PUBLIC_BASE_URL` that is not an absolute https URL.
+
+Advisory warnings that do **not** block: a missing `SENTRY_DSN`, a
+`DATABASE_URL` with no `sslmode` (fine on a private network), a missing
+`SETUP_TOKEN`, and docs left enabled.
+
+### `DEV_MODE` is deprecated
+
+It used to be one boolean controlling eleven unrelated things. It is kept as an
+alias: in development it still forces every backend to `console` and turns the
+exposure switches on, so existing `.env` files keep working — it logs a
+`DeprecationWarning` naming the replacement. In production it is a hard error.
+
+**Keep `DEV_MODE=true` in local development for now.** Parts of the service and
+route layer still read it directly, including the OTP echo. Once those are
+migrated it becomes `false` and then goes away.
+
 ## Environment Variables
 
 Copy `.env.example` to `.env` and fill in your values:
 
 ```env
-# Database (Supabase PostgreSQL)
-DATABASE_URL=postgresql://user:pass@host:5432/postgres?sslmode=require
+# Database — Compose builds this from POSTGRES_* and injects it; the value in
+# .env is only used when running outside Docker.
+DATABASE_URL=postgresql://civic:civic@localhost:5434/civic
 
 # JWT
 SECRET_KEY=your-secret-min-32-chars
 ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=15
+ACCESS_TOKEN_EXPIRE_MINUTES=60
 
-# Storage (Cloudinary)
+# Storage — "local" writes to the uploads volume and serves it at /uploads
+STORAGE_BACKEND=local
+PUBLIC_BASE_URL=http://localhost:8000
+
+# Only used when STORAGE_BACKEND=cloudinary
 CLOUDINARY_CLOUD_NAME=
 CLOUDINARY_API_KEY=
 CLOUDINARY_API_SECRET=
@@ -522,16 +731,37 @@ Workers earn: **First Resolution**, **Dedicated Worker** (10 resolved), **Centur
 
 ## Database Migrations
 
-```bash
-# Apply all pending migrations
-alembic upgrade head
+Run through Compose so the commands hit the containerized database:
 
-# Create a new migration after model changes
-alembic revision --autogenerate -m "describe your change"
+```bash
+# Apply all pending migrations (this is what the `migrate` service does)
+docker compose up migrate
+
+# Inspect history
+docker compose run --rm --no-deps migrate alembic heads
+docker compose run --rm --no-deps migrate alembic history -i
+
+# Create a new migration after model changes. The bind mount is required —
+# without it the generated file is written inside the container and lost.
+docker compose run --rm -v "$PWD/alembic/versions:/app/alembic/versions" \
+  migrate alembic revision --autogenerate -m "describe your change"
 
 # Rollback one step
-alembic downgrade -1
+docker compose run --rm migrate alembic downgrade -1
 ```
+
+Two things to know about this migration history:
+
+- **`merge_integrity_heads` exists for a reason.** Three revisions were once
+  authored against the same parent, leaving three heads and making
+  `alembic upgrade head` fail outright. That merge rejoins them. Two of the
+  three (`r8s9t0u1v2`, `r9t0u1v2w3`) are now no-ops — they duplicated
+  `r0u1v2w3x4` under different constraint names. **Downgrading past the merge
+  point is not supported.**
+- **New models must be exported from `app/models/__init__.py`.** `alembic/env.py`
+  imports that package to populate `Base.metadata`; a model that is not reachable
+  from it is invisible to autogenerate, which will then emit a `DROP TABLE` for
+  its table.
 
 ---
 

@@ -27,7 +27,7 @@ if __name__ == "__main__":
     print(f"\n  Civic API  →  http://0.0.0.0:{port}")
     print(f"  Docs       →  http://localhost:{port}/docs")
     print(f"  Redoc      →  http://localhost:{port}/redoc")
-    print(f"  Auto-reload: .py + .env\n")
+    print("  Auto-reload: .py + .env\n")
 
     try:
         subprocess.run([

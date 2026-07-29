@@ -3,8 +3,9 @@ SMS Service — OTP Delivery via MSG91
 =====================================
 Sends OTP messages to phone numbers using the MSG91 API.
 
-In DEV_MODE or when MSG91_API_KEY is not configured, OTPs are logged
-to the console instead of being sent via SMS.
+With ``SMS_BACKEND="console"`` the OTP is logged instead of sent. That is the
+only way an OTP is ever "delivered" without MSG91 — a missing or broken MSG91
+configuration is reported as a failure, never as a success.
 """
 
 import httpx
@@ -20,19 +21,31 @@ MSG91_OTP_URL = "https://control.msg91.com/api/v5/otp"
 async def send_otp(phone: str, code: str) -> bool:
     """Send a 6-digit OTP to the given phone number.
 
-    In production, uses MSG91's OTP API. In DEV_MODE, logs the OTP
-    to the console and returns True immediately.
+    Uses MSG91's OTP API, or logs the code when ``SMS_BACKEND="console"``.
 
     Args:
         phone: Phone number with country code (e.g. ``"+919876543210"``).
         code:  6-digit OTP code to send.
 
     Returns:
-        True if the OTP was sent (or logged in dev mode), False on failure.
+        True if the OTP was sent (or logged by the console backend), False on
+        failure. The caller turns False into a 503 — see
+        ``app/routes/auth.py``.
     """
-    if settings.DEV_MODE or not settings.MSG91_API_KEY:
-        logger.warning(f"[DEV] OTP for {phone}: {code}")
+    if settings.SMS_BACKEND == "console":
+        logger.warning(f"[console] OTP for {phone}: {code}")
         return True
+
+    # Previously this fell back to `return True` when the key was missing, so
+    # /auth/send-otp answered "OTP sent successfully" while sending nothing —
+    # locking every user out with no error surfaced anywhere.
+    if not settings.MSG91_API_KEY or not settings.MSG91_TEMPLATE_ID:
+        logger.error(
+            "MSG91 is not configured (API key and/or template ID missing) — "
+            "cannot send OTP to %s",
+            phone,
+        )
+        return False
 
     # MSG91 expects number with country code, no + prefix
     normalized = phone.lstrip("+")

@@ -11,7 +11,6 @@ Frontend Integration Notes:
 """
 
 import uuid
-import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -19,18 +18,18 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-import bleach  # FIX MEDIUM PRIORITY BUG #7: HTML sanitization
 
-from app.core.deps import get_current_user, require_role
+from app.core.time import now_utc
+from app.core.config import settings
+from app.core.deps import ADMIN_ROLES, apply_admin_scope, get_current_user, require_role
 from app.core.logger import get_logger
 from app.core.exceptions import (
     ValidationError, ResourceNotFoundError, AuthorizationError,
     ExternalServiceError, ProcessingError, CivicException
 )
 from app.core.constants import (
-    BUILT_IN_ISSUE_TYPES, ISSUE_SEVERITY_DEFAULT, ISSUE_PRIORITY_MEDIUM,
-    ISSUE_PRIORITY_URGENT, ISSUE_STATUS_OPEN, ISSUE_STATUS_RESOLVED, ISSUE_STATUS_CLOSED,
-    MAX_PHOTO_SIZE_MB, ALLOWED_EXTENSIONS, DAILY_ISSUE_LIMIT_CITIZEN
+    BUILT_IN_ISSUE_TYPES, ISSUE_SEVERITY_DEFAULT, ISSUE_PRIORITY_DEFAULT, ISSUE_PRIORITY_URGENT, ISSUE_STATUS_CLOSED,
+    DAILY_ISSUE_LIMIT_CITIZEN
 )
 from app.database import get_db
 from app.models.issue import Issue
@@ -40,11 +39,10 @@ from app.models.user import User
 from app.schemas.issue import IssueCommentCreate, IssueCommentResponse, IssueCreate, IssueListResponse, IssueResponse, IssueUpdate
 from app.services.ai_service import check_duplicate, classify_issue
 from app.services.geo_service import auto_assign
-from app.services.notification_service import notify, notify_bookmarkers, notify_localized, send_sms_status_update
-from app.services.storage import upload_image
+from app.services.notification_service import notify, notify_localized, send_sms_status_update
+from app.services.storage import upload_image_or_raise
 from app.services.utils import (
-    validate_photo_file, get_issue_or_404, get_user_or_404,
-    apply_search_filter, apply_pagination, batch_commit
+    validate_photo_file, get_issue_or_404, batch_commit
 )
 
 logger = get_logger("issues")
@@ -93,6 +91,13 @@ def _validate_status_transition(current_status: str, new_status: str, user_role:
     
     FIX: HIGH PRIORITY BUG #3 - Status transition validation missing
     """
+    # The table below is written in terms of "admin". Every admin role carries
+    # the same status-transition authority — they differ in *which issues* they
+    # may touch, which is enforced by the caller's scope check, not here. Without
+    # this normalization a ward_admin was rejected for every transition.
+    if user_role in ADMIN_ROLES:
+        user_role = "admin"
+
     valid_transitions = {
         ("open", "assigned"): {"admin"},
         ("open", "in_progress"): {"admin"},
@@ -157,7 +162,7 @@ async def create_issue(
 
         # ──── RATE LIMITING ─────────────────────────────────────────────────
         if current_user.role == "citizen":
-            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
             today_count = (
                 db.query(Issue)
                 .filter(
@@ -269,9 +274,9 @@ async def create_issue(
         # ──── SOS ESCALATION ────────────────────────────────────────────────
         if body.is_sos:
             issue.is_escalated = True
-            issue.escalated_at = datetime.utcnow()
+            issue.escalated_at = now_utc()
             logger.warning(
-                f"SOS issue created",
+                "SOS issue created",
                 extra={
                     "issue_id": str(issue.id),
                     "reporter_id": str(current_user.id),
@@ -286,7 +291,7 @@ async def create_issue(
             duplicate = check_duplicate(body.issue_type, body.latitude, body.longitude, db)
         except Exception as e:
             logger.warning(
-                f"AI duplicate check failed, falling back to rule-based detection",
+                "AI duplicate check failed, falling back to rule-based detection",
                 extra={
                     "error": str(e),
                     "issue_type": body.issue_type,
@@ -297,7 +302,7 @@ async def create_issue(
 
         if not duplicate:
             # Rule-based fallback: same type + same ward within 24h
-            since = datetime.utcnow() - timedelta(hours=24)
+            since = now_utc() - timedelta(hours=24)
             rule_duplicate = (
                 db.query(Issue)
                 .filter(
@@ -317,7 +322,7 @@ async def create_issue(
             issue.is_duplicate = True
             issue.parent_issue_id = duplicate.id
             logger.info(
-                f"Issue marked as duplicate",
+                "Issue marked as duplicate",
                 extra={
                     "issue_id": str(issue.id),
                     "parent_issue_id": str(duplicate.id)
@@ -349,7 +354,7 @@ async def create_issue(
                         )
                     except Exception as e:
                         logger.error(
-                            f"Failed to notify worker of assignment",
+                            "Failed to notify worker of assignment",
                             extra={"worker_id": str(worker.id), "error": str(e)}
                         )
 
@@ -364,12 +369,12 @@ async def create_issue(
                         )
                     except Exception as e:
                         logger.error(
-                            f"Failed to send SMS to reporter",
+                            "Failed to send SMS to reporter",
                             extra={"reporter_id": str(current_user.id), "error": str(e)}
                         )
 
                     logger.info(
-                        f"Issue auto-assigned to worker",
+                        "Issue auto-assigned to worker",
                         extra={
                             "issue_id": str(issue.id),
                             "worker_id": str(worker.id)
@@ -378,7 +383,7 @@ async def create_issue(
             except ExternalServiceError as e:
                 # Auto-assignment is non-critical, log and continue
                 logger.warning(
-                    f"Auto-assignment service unavailable",
+                    "Auto-assignment service unavailable",
                     extra={"issue_id": str(issue.id), "error": str(e)}
                 )
 
@@ -388,7 +393,6 @@ async def create_issue(
         if body.is_sos and not issue.sos_radius_notified:
             try:
                 # Notify citizens within 500m radius
-                from sqlalchemy import func as sql_func
                 from math import radians, cos, sin, asin, sqrt
 
                 def haversine(lat1, lon1, lat2, lon2):
@@ -432,7 +436,7 @@ async def create_issue(
                 issue.sos_radius_notified = True  # Set flag to prevent duplicate broadcasts
                 db.commit()
                 logger.warning(
-                    f"SOS broadcast completed",
+                    "SOS broadcast completed",
                     extra={"issue_id": str(issue.id), "notified_citizens": notified}
                 )
 
@@ -455,17 +459,17 @@ async def create_issue(
                             ward=issue.ward or "unknown",
                         )
                     logger.info(
-                        f"SOS alert sent to admins",
+                        "SOS alert sent to admins",
                         extra={"issue_id": str(issue.id), "admin_count": len(admins)}
                     )
                 except Exception as e:
                     logger.error(
-                        f"Failed to notify admins of SOS",
+                        "Failed to notify admins of SOS",
                         extra={"issue_id": str(issue.id), "error": str(e)}
                     )
             except Exception as e:
                 logger.error(
-                    f"SOS broadcast failed",
+                    "SOS broadcast failed",
                     extra={"issue_id": str(issue.id), "error": str(e)}
                 )
 
@@ -475,13 +479,13 @@ async def create_issue(
             award_event(db, current_user.id, "report_issue", reference_id=issue.id)
         except Exception as e:
             logger.warning(
-                f"Failed to award points for issue report",
+                "Failed to award points for issue report",
                 extra={"reporter_id": str(current_user.id), "error": str(e)}
             )
 
         # ──── RESPONSE ──────────────────────────────────────────────────────
         logger.info(
-            f"Issue report created successfully",
+            "Issue report created successfully",
             extra={
                 "issue_id": str(issue.id),
                 "reporter_id": str(current_user.id),
@@ -498,7 +502,7 @@ async def create_issue(
         raise
     except Exception as e:
         logger.error(
-            f"Unexpected error creating issue",
+            "Unexpected error creating issue",
             extra={"reporter_id": str(current_user.id), "error": str(e)},
             exc_info=True
         )
@@ -507,95 +511,20 @@ async def create_issue(
             "Failed to create issue. Please try again later."
         )
 
-    # ── SOS Auto-Broadcast: alert nearby citizens + all admins ──────────
-    # FIX: HIGH PRIORITY BUG #2 - Duplicate SOS broadcasts due to race condition
-    # Use row-level locking to prevent concurrent broadcast
-    if body.is_sos:
-        try:
-            # Lock the issue row to prevent concurrent SOS broadcasts
-            locked_issue = (
-                db.query(Issue)
-                .filter(Issue.id == issue.id)
-                .with_for_update()  # Row-level lock
-                .first()
-            )
-            
-            # Check if already broadcast (double-check pattern)
-            if not locked_issue.sos_radius_notified:
-                from app.services.notification_service import _send_fcm, notify_localized
-                from math import pi, acos, sin, cos
-
-                R = 6371  # Earth radius in km
-                SOS_RADIUS_KM = 0.5  # 500m radius
-                lat_rad = body.latitude * pi / 180.0
-                lon_rad = body.longitude * pi / 180.0
-
-                # Alert all citizens within 500m
-                nearby_citizens = (
-                    db.query(User)
-                    .filter(
-                        User.is_active == True,
-                        User.latitude.isnot(None),
-                        User.longitude.isnot(None),
-                    )
-                    .all()
-                )
-                notified = 0
-                for citizen in nearby_citizens:
-                    try:
-                        c_lat = (citizen.latitude or 0) * pi / 180.0
-                        c_lon = (citizen.longitude or 0) * pi / 180.0
-                        cos_angle = max(-1, min(1,
-                            sin(lat_rad) * sin(c_lat) + cos(lat_rad) * cos(c_lat) * cos(c_lon - lon_rad)
-                        ))
-                        dist = R * acos(cos_angle)
-                        if dist <= SOS_RADIUS_KM:
-                            from app.services.notification_service import notify as _notify_sos
-                            _notify_sos(
-                                db=db,
-                                user_id=str(citizen.id),
-                                title="DANGER: Hazard Near You",
-                                body=f"Critical hazard reported near {issue.address or 'your area'}. Please avoid the area.",
-                                notification_type="system",
-                                issue_id=str(issue.id),
-                                fcm_token=citizen.fcm_token,
-                            )
-                            notified += 1
-                    except Exception:
-                        pass
-
-                issue.sos_radius_notified = True
-                db.commit()
-                logger.warning(f"SOS broadcast: {notified} citizens alerted within 500m")
-
-                # Notify ALL admins immediately
-                admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()
-                for admin_user in admins:
-                    notify_localized(
-                        db=db, user=admin_user, key="sos_alert",
-                        notification_type="system",
-                        issue_id=str(issue.id),
-                        issue_id_short=str(issue.id)[:8],
-                        issue_type=issue.issue_type,
-                        address=issue.address or "Unknown",
-                        ward=issue.ward or "unknown",
-                    )
-                logger.info(f"SOS alert sent to {len(admins)} admin(s)")
-            else:
-                logger.info(f"SOS broadcast already sent for issue {issue.id}, skipping duplicate")
-        except Exception as e:
-            logger.error(f"SOS broadcast failed (non-fatal): {e}")
-
-    # Rewards: citizen earns points for reporting
-    try:
-        from app.services.rewards_service import award_event
-        award_event(db, current_user.id, "report_issue", reference_id=issue.id)
-    except Exception:
-        pass
-
-    result = IssueResponse.model_validate(issue)
-    result.comment_count = _get_comment_count(db, issue.id)
-    return result
+    # NOTE: 90 lines of unreachable code were removed here.
+    #
+    # The try block above ends with `return result` and every handler ends
+    # with `raise`, so nothing after it could ever execute. The dead block was
+    # a second SOS broadcast and a second `award_event("report_issue")` call —
+    # both of which the live path above already performs, guarded by the
+    # `sos_radius_notified` flag.
+    #
+    # It also contained the `with_for_update()` row lock described in the
+    # comment as "FIX HIGH PRIORITY BUG #2 - Duplicate SOS broadcasts due to
+    # race condition". Anyone reading this file believed SOS creation took a
+    # row lock. It did not, and does not — but it does not need one: the issue
+    # was created by this request microseconds earlier and no other request
+    # can hold a reference to it yet.
 
 
 @router.post("/{issue_id}/photos", response_model=IssueResponse)
@@ -657,7 +586,10 @@ async def upload_photos(
                 "At least one photo is required"
             )
 
-        max_photos = MAX_PHOTOS_PER_ISSUE if hasattr(globals(), 'MAX_PHOTOS_PER_ISSUE') else 10
+        # `hasattr(globals(), name)` asks whether a *dict object* has that
+        # attribute, which is always False — so this was hardwired to 10 and the
+        # constant it referenced was never defined anyway. Now a real setting.
+        max_photos = settings.MAX_PHOTOS_PER_ISSUE
         current_photo_count = len(issue.before_photos or []) if photo_type == "before" else len(issue.after_photos or [])
         if current_photo_count + len(photos) > max_photos:
             raise ValidationError(
@@ -690,18 +622,12 @@ async def upload_photos(
                 # Upload to storage
                 try:
                     filename = f"{photo_type}_{uuid.uuid4().hex[:8]}"
-                    url = upload_image(
+                    url = upload_image_or_raise(
                         file_bytes,
                         filename,
                         user_id=str(current_user.id),
                         issue_id=str(issue_id),
                     )
-                    if not url:
-                        raise ExternalServiceError(
-                            "Storage",
-                            "Upload returned empty URL",
-                            transient=False
-                        )
                     uploaded_urls.append(url)
 
                     # Save first photo for AI classification
@@ -710,7 +636,7 @@ async def upload_photos(
                         first_mime = mime_type
 
                     logger.info(
-                        f"Photo uploaded successfully",
+                        "Photo uploaded successfully",
                         extra={
                             "issue_id": str(issue_id),
                             "photo_type": photo_type,
@@ -732,7 +658,7 @@ async def upload_photos(
                 raise  # Re-raise validation/auth errors immediately
             except Exception as e:
                 logger.error(
-                    f"Error processing individual photo",
+                    "Error processing individual photo",
                     extra={
                         "issue_id": str(issue_id),
                         "filename": (photo_file.filename or "unknown"),
@@ -755,7 +681,7 @@ async def upload_photos(
                     issue.ai_suggested_description = ai_result.get("suggested_description")
 
                     logger.info(
-                        f"AI classification completed",
+                        "AI classification completed",
                         extra={
                             "issue_id": str(issue_id),
                             "ai_type": ai_result.get("issue_type"),
@@ -766,7 +692,7 @@ async def upload_photos(
                 except Exception as e:
                     # AI classification is non-critical
                     logger.warning(
-                        f"AI classification failed (non-critical)",
+                        "AI classification failed (non-critical)",
                         extra={"issue_id": str(issue_id), "error": str(e)}
                     )
         else:  # after photos
@@ -778,7 +704,7 @@ async def upload_photos(
 
         # ──── LOGGING & RESPONSE ────────────────────────────────────────────
         logger.info(
-            f"Photos uploaded successfully",
+            "Photos uploaded successfully",
             extra={
                 "issue_id": str(issue_id),
                 "photo_type": photo_type,
@@ -797,7 +723,7 @@ async def upload_photos(
         raise
     except Exception as e:
         logger.error(
-            f"Unexpected error uploading photos",
+            "Unexpected error uploading photos",
             extra={
                 "issue_id": str(issue_id),
                 "photo_type": photo_type,
@@ -1354,7 +1280,32 @@ def update_issue(
             if body.status == "closed" and issue.status == "resolved":
                 issue.status = "closed"
 
-        if current_user.role in ("worker", "admin"):
+        # A worker may only touch the issue actually assigned to them. There was
+        # no such check here — unlike POST /workers/tasks/{id}/resolve, which has
+        # always filtered on assigned_worker_id — so any worker could PATCH any
+        # other worker's issue to "resolved", closing someone else's task and
+        # firing a resolution notification at the citizen.
+        if current_user.role == "worker" and issue.assigned_worker_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This issue is not assigned to you",
+            )
+
+        # Sub-admins were matched by none of the branches below, so a ward_admin
+        # got 200 OK with nothing written — a silent no-op. They are routed with
+        # the super-admin now, gated on their geographic scope.
+        is_scoped_admin = current_user.role in ADMIN_ROLES
+        if is_scoped_admin and current_user.role != "admin":
+            in_scope = apply_admin_scope(
+                db.query(Issue.id).filter(Issue.id == issue.id), current_user, Issue
+            ).first()
+            if not in_scope:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This issue is outside your administrative jurisdiction",
+                )
+
+        if current_user.role == "worker" or is_scoped_admin:
             if body.status is not None:
                 # FIX: HIGH PRIORITY BUG #3 - Validate status transitions
                 _validate_status_transition(issue.status, body.status, current_user.role)
@@ -1375,7 +1326,7 @@ def update_issue(
             if body.resolution_notes is not None:
                 issue.resolution_notes = body.resolution_notes
 
-        if current_user.role == "admin":
+        if is_scoped_admin:
             if body.assigned_worker_id is not None:
                 issue.assigned_worker_id = body.assigned_worker_id
                 issue.status = "assigned"
@@ -1396,7 +1347,7 @@ def update_issue(
     # ── Post-update notifications ─────────────────────────────────────────────
     try:
         # Admin manually assigned a worker → notify the worker
-        if current_user.role == "admin" and body.assigned_worker_id is not None and issue.assigned_worker:
+        if is_scoped_admin and body.assigned_worker_id is not None and issue.assigned_worker:
             notify_localized(
                 db=db, user=issue.assigned_worker, key="assignment",
                 notification_type="assignment", issue_id=str(issue.id),
@@ -1404,7 +1355,7 @@ def update_issue(
             )
 
         # Admin/worker status change → notify reporter
-        if body.status is not None and current_user.role in ("worker", "admin") and issue.reporter:
+        if body.status is not None and (current_user.role == "worker" or is_scoped_admin) and issue.reporter:
             if body.status == "resolved":
                 notify_localized(
                     db=db, user=issue.reporter, key="resolution",
@@ -1454,9 +1405,41 @@ def update_issue(
 # ── Issue comments ────────────────────────────────────────────────────────────
 
 
-def _check_comment_access(issue: Issue, current_user: User) -> None:
-    """All authenticated users can read and post comments on any issue."""
-    pass  # open to all authenticated users
+def _check_comment_access(issue: Issue, current_user: User, db: Session) -> None:
+    """Enforce who may read and write comments on an issue.
+
+    - Citizens: only issues they reported.
+    - Workers: only issues assigned to them.
+    - Admins: only issues inside their geographic scope (super-admins: all).
+
+    This was an empty ``pass`` while the docstrings of both callers stated these
+    exact rules and documented a 403 that could never fire. The restriction is
+    not novel — ``list_issues`` already limits a citizen to
+    ``Issue.reporter_id == current_user.id``, so a citizen could not see another
+    citizen's issue in a listing but could read and post on its comment thread
+    by issue ID.
+
+    Raises:
+        HTTPException 403: The user has no access to this issue.
+    """
+    if current_user.role == "citizen":
+        allowed = issue.reporter_id == current_user.id
+    elif current_user.role == "worker":
+        allowed = issue.assigned_worker_id == current_user.id
+    elif current_user.role in ADMIN_ROLES:
+        allowed = bool(
+            apply_admin_scope(
+                db.query(Issue.id).filter(Issue.id == issue.id), current_user, Issue
+            ).first()
+        )
+    else:
+        allowed = False
+
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this issue",
+        )
 
 
 @router.post("/{issue_id}/comments", response_model=IssueCommentResponse, status_code=status.HTTP_201_CREATED)
@@ -1485,7 +1468,7 @@ def add_comment(
     if not issue:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
 
-    _check_comment_access(issue, current_user)
+    _check_comment_access(issue, current_user, db)
 
     # MEDIUM PRIORITY BUG FIX #3: Comment nesting DoS protection
     MAX_COMMENT_DEPTH = 5
@@ -1573,15 +1556,20 @@ def add_comment(
 @router.get("/{issue_id}/comments", response_model=List[IssueCommentResponse])
 def list_comments(
     issue_id: uuid.UUID,
+    limit: int = Query(200, ge=1, le=500, description="Maximum comments to return"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List all comments on an issue in chronological order.
+    """List comments on an issue in chronological order.
 
     Access control:
-    - **Citizens**: own issues only.
+    - **Citizens**: own issues only, and only public comments.
     - **Workers**: assigned issues only.
-    - **Admins**: any issue.
+    - **Admins**: issues within their jurisdiction.
+
+    Bounded by ``limit``. This was an unbounded ``.all()`` that then built the
+    full reply tree in memory, so one heavily-discussed issue could return an
+    arbitrarily large response.
 
     Returns:
         List of ``IssueCommentResponse`` objects.
@@ -1594,7 +1582,7 @@ def list_comments(
     if not issue:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
 
-    _check_comment_access(issue, current_user)
+    _check_comment_access(issue, current_user, db)
 
     # Citizens only see public comments; workers and admins see everything
     can_see_internal = current_user.role in (
@@ -1608,7 +1596,7 @@ def list_comments(
              .filter(IssueComment.is_internal == False)  # noqa: E712
              .filter(User.role.notin_(["worker"]))
         )
-    all_comments = q.order_by(IssueComment.created_at).all()
+    all_comments = q.order_by(IssueComment.created_at).limit(limit).all()
 
     # Build nested structure: top-level comments with replies
     comment_map = {c.id: IssueCommentResponse.model_validate(c) for c in all_comments}
@@ -1889,16 +1877,18 @@ async def transcribe_audio(
         ``{ "text": "transcribed content", "language": "hi", "duration_seconds": 12.5 }``
     """
     import os
-    import tempfile
-
     ALLOWED_TYPES = {"audio/m4a", "audio/mp4", "audio/mpeg", "audio/wav", "audio/ogg", "audio/x-m4a", "audio/aac"}
     ALLOWED_EXTENSIONS = {".m4a", ".mp4", ".mp3", ".wav", ".ogg", ".aac"}
     MAX_SIZE = 25 * 1024 * 1024  # 25 MB
 
     try:
-        # Validate file type
+        # Validate file type. Both the extension and the declared content type
+        # must be acceptable — this was `ext not in ALLOWED and ctype not in
+        # ALLOWED`, i.e. rejected only when *both* were wrong, so `payload.exe`
+        # with `Content-Type: audio/mpeg` sailed through.
         ext = os.path.splitext(audio.filename or "")[1].lower()
-        if ext not in ALLOWED_EXTENSIONS and audio.content_type not in ALLOWED_TYPES:
+        ctype = (audio.content_type or "").split(";")[0].strip()
+        if ext not in ALLOWED_EXTENSIONS or ctype not in ALLOWED_TYPES:
             raise HTTPException(status_code=400, detail="Unsupported audio format. Use .m4a, .mp3, .wav, or .ogg.")
 
         # Read audio data
@@ -1910,47 +1900,50 @@ async def transcribe_audio(
 
         logger.info(f"Transcription request: user={current_user.id}, lang={language}, size={len(audio_data)}")
 
-        # Try OpenAI Whisper
-        openai_key = os.environ.get("OPENAI_API_KEY")
-        if openai_key:
-            try:
-                import httpx
+        # A feature that is switched off is a 501, not a 200 with an empty
+        # string. Returning `{"text": ""}` is indistinguishable from a
+        # successful transcription of silence, so the client had no way to tell
+        # the difference and would show the user a blank result.
+        if not settings.OPENAI_API_KEY:
+            logger.warning("Transcription requested but OPENAI_API_KEY is not set")
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="Audio transcription is not configured on this server.",
+            )
 
-                # Write to temp file for multipart upload
-                with tempfile.NamedTemporaryFile(suffix=ext or ".m4a", delete=False) as tmp:
-                    tmp.write(audio_data)
-                    tmp_path = tmp.name
+        try:
+            import httpx
 
-                try:
-                    async with httpx.AsyncClient(timeout=60) as client:
-                        with open(tmp_path, "rb") as f:
-                            resp = await client.post(
-                                "https://api.openai.com/v1/audio/transcriptions",
-                                headers={"Authorization": f"Bearer {openai_key}"},
-                                files={"file": (audio.filename or "audio.m4a", f, audio.content_type or "audio/m4a")},
-                                data={"model": "whisper-1", "language": language},
-                            )
+            # Bytes straight into the multipart body. This used to write the
+            # upload to a NamedTemporaryFile and read it back — synchronous disk
+            # I/O for up to 25 MB inside an `async def`, blocking the event loop
+            # twice over, purely to hand httpx a file object it did not need.
+            async with httpx.AsyncClient(timeout=settings.AI_REQUEST_TIMEOUT_SECONDS * 2) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
+                    files={"file": (audio.filename or "audio.m4a", audio_data, ctype or "audio/m4a")},
+                    data={"model": "whisper-1", "language": language},
+                )
 
-                    if resp.status_code == 200:
-                        result = resp.json()
-                        text = result.get("text", "").strip()
-                        logger.info(f"Whisper transcription success: {len(text)} chars")
-                        return {"text": text, "language": language, "model": "whisper-1"}
-                    else:
-                        logger.warning(f"Whisper API error {resp.status_code}: {resp.text[:200]}")
-                finally:
-                    os.unlink(tmp_path)
-            except Exception as e:
-                logger.warning(f"Whisper transcription failed, falling back: {e}")
+            if resp.status_code == 200:
+                text = resp.json().get("text", "").strip()
+                logger.info(f"Whisper transcription success: {len(text)} chars")
+                return {"text": text, "language": language, "model": "whisper-1"}
 
-        # Fallback: return a placeholder indicating server-side transcription is unavailable
-        logger.warning("No OPENAI_API_KEY set — returning audio-received acknowledgment")
-        return {
-            "text": "",
-            "language": language,
-            "model": "none",
-            "message": "Audio received. Server-side transcription requires OPENAI_API_KEY configuration.",
-        }
+            logger.warning(f"Whisper API error {resp.status_code}: {resp.text[:200]}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Transcription provider returned an error. Please try again.",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Whisper transcription failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Transcription is temporarily unavailable. Please try again.",
+            )
 
     except HTTPException:
         raise

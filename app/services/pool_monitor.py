@@ -13,11 +13,12 @@ Monitors:
 
 import asyncio
 import threading
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import timedelta
+from typing import Dict, List
 
+from app.core.time import now_utc
 from app.core.logger import get_logger
-from app.database import get_pool_stats, engine
+from app.database import get_pool_stats
 
 logger = get_logger("pool_monitor")
 
@@ -35,7 +36,7 @@ class PoolHealthMetrics:
         """Record a connection pool error."""
         with self.lock:
             self.errors.append({
-                'timestamp': datetime.utcnow(),
+                'timestamp': now_utc(),
                 'type': error_type,
                 'message': message,
             })
@@ -45,14 +46,14 @@ class PoolHealthMetrics:
         """Record a connection pool warning."""
         with self.lock:
             self.warnings.append({
-                'timestamp': datetime.utcnow(),
+                'timestamp': now_utc(),
                 'message': message,
             })
             self._cleanup_old_entries()
 
     def _cleanup_old_entries(self):
         """Remove entries older than the window period."""
-        cutoff = datetime.utcnow() - timedelta(minutes=self.window_minutes)
+        cutoff = now_utc() - timedelta(minutes=self.window_minutes)
         self.errors = [e for e in self.errors if e['timestamp'] > cutoff]
         self.warnings = [w for w in self.warnings if w['timestamp'] > cutoff]
 
@@ -82,7 +83,7 @@ def get_pool_health() -> Dict:
         health_status = assess_pool_health(stats)
 
         return {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': now_utc().isoformat(),
             'status': health_status['status'],
             'message': health_status['message'],
             'pool_stats': stats,
@@ -92,7 +93,7 @@ def get_pool_health() -> Dict:
     except Exception as e:
         logger.error(f"Error getting pool health: {e}", exc_info=True)
         return {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': now_utc().isoformat(),
             'status': 'unknown',
             'message': f"Could not assess pool health: {str(e)}",
             'pool_stats': {},
@@ -105,9 +106,17 @@ def assess_pool_health(stats: Dict) -> Dict:
     recommendations = []
 
     try:
-        checked_out = stats.get('checked_out', 0)
-        pool_size = stats.get('pool_size', 5)
-        overflow = stats.get('overflow', 0)
+        # Coerce first. database.py yields the string 'N/A' when the pool lacks
+        # an attribute, and `'N/A' < pool_size * 0.8` raises TypeError — caught
+        # below, so the endpoint reported status "unknown" instead of a real
+        # assessment, on exactly the pools whose internals differ.
+        def _num(key, default):
+            value = stats.get(key, default)
+            return value if isinstance(value, (int, float)) else default
+
+        checked_out = _num('checked_out', 0)
+        pool_size = _num('pool_size', 5)
+        overflow = _num('overflow', 0)
 
         # Healthy: less than 80% utilization
         if checked_out < (pool_size * 0.8):
@@ -212,6 +221,10 @@ class PoolHealthCheckThread(threading.Thread):
         super().__init__(daemon=daemon)
         self.interval_seconds = interval_seconds
         self.running = True
+        # One Event for the lifetime of the thread — this is what stop() sets
+        # and what the loop sleeps on, so shutdown is immediate rather than
+        # waiting out a full interval (or never waking at all).
+        self._stop_event = threading.Event()
         self.name = "PoolHealthCheckThread"
 
     def run(self):
@@ -230,13 +243,25 @@ class PoolHealthCheckThread(threading.Thread):
                 elif status == 'warning':
                     logger.warning(f"WARNING: {health.get('message')}")
 
-                threading.Event().wait(self.interval_seconds)
+                # Wait on the shared stop Event, so stop() wakes us immediately.
+                # This used to be `threading.Event().wait(...)` — a brand-new
+                # Event constructed each iteration, which nothing could ever
+                # set. stop() flipped a flag the sleeping thread could not see,
+                # so join(timeout=5) always timed out and dispose_pool() ran
+                # while the monitor was still live. The shutdown log said
+                # otherwise.
+                if self._stop_event.wait(self.interval_seconds):
+                    break
 
             except Exception as e:
                 logger.error(f"Error in pool health check: {e}", exc_info=True)
-                threading.Event().wait(self.interval_seconds)
+                if self._stop_event.wait(self.interval_seconds):
+                    break
+
+        logger.info("Pool health check thread stopped")
 
     def stop(self):
-        """Stop the monitoring thread."""
+        """Stop the monitoring thread. Returns immediately; join() to wait."""
         self.running = False
+        self._stop_event.set()
         logger.info("Stopping pool health check thread")

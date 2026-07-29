@@ -19,12 +19,14 @@ Public API:
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, text as sa_text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.core.time import now_utc
 from app.core.logger import get_logger
 from app.services.utils import get_users_by_role
 
@@ -130,6 +132,28 @@ BADGE_DEFINITIONS: dict[str, dict] = {
 }
 
 
+# Namespace for deriving stable reference_ids for events that repeat on a
+# schedule rather than against a row. reference_id is a UUID column, so a period
+# key like "2026-W30" has to be hashed into one.
+_PERIOD_NAMESPACE = uuid.UUID("6f1b7e4c-9a2d-4f8b-8c3e-1d5a7b9c0e2f")
+
+
+def reference_for_period(event: str, user_id: uuid.UUID, period: str) -> uuid.UUID:
+    """Build a deterministic reference_id for a per-period award.
+
+    Args:
+        event:   Reward event key, e.g. ``"weekly_streak"``.
+        user_id: The user being awarded.
+        period:  A stable label for the period, e.g. ``"2026-W30"``.
+
+    Returns:
+        The same UUID every time for the same three inputs, so re-running the
+        job in the same period hits the idempotency constraint instead of
+        paying out again.
+    """
+    return uuid.uuid5(_PERIOD_NAMESPACE, f"{event}:{user_id}:{period}")
+
+
 # ── Main public API ───────────────────────────────────────────────────────────
 
 def award_event(
@@ -156,40 +180,55 @@ def award_event(
         reference_id: Optional related object UUID (issue, vote, etc.).
         note:         Optional human-readable note stored in the ledger.
     """
-    try:
-        from app.models.reward import RewardTransaction
+    from app.models.reward import RewardTransaction
 
-        points = POINT_VALUES.get(event)
-        if points is None:
-            logger.warning(f"Unknown reward event: {event}")
+    points = POINT_VALUES.get(event)
+    if points is None:
+        logger.warning(f"Unknown reward event: {event}")
+        return
+
+    try:
+        # Idempotency is enforced by the database, not by a preceding SELECT.
+        #
+        # The old check-then-insert had no unique index behind it, so two
+        # concurrent requests both saw "no existing row" and both inserted — a
+        # double-tapped "resolve" button paid a worker twice and permanently
+        # inflated the counts that unlock badges. ON CONFLICT DO NOTHING against
+        # uq_reward_event_reference closes that window.
+        #
+        # Events with reference_id=None are genuinely repeatable and skip the
+        # constraint entirely (NULLs do not collide in a Postgres unique index).
+        # Callers that must not repeat pass a deterministic reference_id — see
+        # reference_for_period below.
+        stmt = (
+            pg_insert(RewardTransaction.__table__)
+            .values(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                points=points,
+                event_type=event,
+                reference_id=reference_id,
+                note=note or f"+{points} for {event}",
+            )
+            # Index inference, not `constraint=`. uq_reward_event_reference is a
+            # *partial* unique index, and Postgres only accepts ON CONFLICT ON
+            # CONSTRAINT for real constraints — a partial index has to be matched
+            # by repeating its columns and its WHERE predicate.
+            .on_conflict_do_nothing(
+                index_elements=["user_id", "event_type", "reference_id"],
+                index_where=sa_text("reference_id IS NOT NULL"),
+            )
+        )
+        result = db.execute(stmt)
+        db.commit()
+
+        if result.rowcount == 0:
+            logger.debug(
+                "Reward already awarded: user %s (%s) for reference %s",
+                user_id, event, reference_id,
+            )
             return
 
-        # IDEMPOTENCY CHECK: Don't create duplicate transactions for same event on same reference
-        if reference_id:
-            existing = db.query(RewardTransaction).filter(
-                RewardTransaction.user_id == user_id,
-                RewardTransaction.event_type == event,
-                RewardTransaction.reference_id == reference_id,
-            ).first()
-            if existing:
-                logger.info(f"Reward already awarded: user {user_id} +{points} pts ({event}) for reference {reference_id}")
-                return
-
-        tx = RewardTransaction(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            points=points,
-            event_type=event,
-            reference_id=reference_id,
-            note=note or f"+{points} for {event}",
-        )
-        db.add(tx)
-        
-        # FIX: Check badge unlocks BEFORE commit (in same transaction)
-        _check_badge_unlocks(db, user_id, event)
-        
-        # Single commit for both points and badges
-        db.commit()
         logger.info(f"Reward: user {user_id} +{points} pts ({event})")
 
     except Exception as e:
@@ -198,6 +237,23 @@ def award_event(
             db.rollback()
         except Exception as rollback_err:
             logger.error(f"Rollback also failed: {rollback_err}", exc_info=True)
+        return
+
+    # Badges are checked *after* the points are committed, in their own
+    # transaction. They used to be checked before the commit, and the badge
+    # handler's `db.rollback()` on failure discarded the still-pending
+    # RewardTransaction along with it — after which award_event committed an
+    # empty transaction and logged "+30 pts" for points that no longer existed.
+    #
+    # Wrapped, because this function's contract is that it never raises: a
+    # reward is a side effect of resolving an issue or casting a vote, and
+    # nothing about it should be able to fail the request that triggered it.
+    try:
+        _check_badge_unlocks(db, user_id, event)
+    except Exception as e:
+        logger.error(
+            f"Badge check raised for user {user_id} event {event}: {e}", exc_info=True
+        )
 
 
 def get_user_summary(db: Session, user_id: uuid.UUID) -> dict:
@@ -406,11 +462,24 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
         return counts.get(event_type, {}).get("points", 0)
 
     def _grant(key: str):
-        if key not in earned:
-            badge = UserBadge(id=uuid.uuid4(), user_id=user_id, badge_key=key)
-            db.add(badge)
-            db.commit()
-            earned.add(key)
+        """Grant a badge, at most once, without racing.
+
+        The in-memory `earned` set is only a fast path. The real guarantee is
+        uq_user_badge: two concurrent requests both computing `earned` without
+        this key would both have inserted, giving the user a duplicate badge, a
+        wrong badge_count on the leaderboard and two "Badge Unlocked" pushes.
+        """
+        if key in earned:
+            return
+        stmt = (
+            pg_insert(UserBadge.__table__)
+            .values(id=uuid.uuid4(), user_id=user_id, badge_key=key)
+            .on_conflict_do_nothing(constraint="uq_user_badge")
+        )
+        inserted = db.execute(stmt).rowcount
+        db.commit()
+        earned.add(key)
+        if inserted:
             logger.info(f"Badge unlocked: user {user_id} earned '{key}'")
             # Send FCM notification for badge
             _notify_badge(user, key)
@@ -468,11 +537,13 @@ def _check_badge_unlocks(db: Session, user_id: uuid.UUID, triggered_by_event: st
                 _grant("streak_master")
 
     except Exception as e:
+        # Badges are cosmetic; points are not. This handler must never discard
+        # work the caller staged. It used to call db.rollback() on the shared
+        # session, which threw away the pending RewardTransaction that
+        # award_event had just added — the user lost the points and the log said
+        # they got them. award_event now commits points before calling this, so
+        # a failure here costs a badge and nothing else.
         logger.error(f"Badge check failed for user {user_id}: {e}", exc_info=True, extra={"user_id": str(user_id)})
-        try:
-            db.rollback()
-        except Exception as rollback_err:
-            logger.error(f"Rollback also failed during badge check: {rollback_err}", exc_info=True)
 
 
 # ── Weekly streak checker (called from auto-escalation loop or cron) ─────────
@@ -486,9 +557,8 @@ def check_weekly_streaks(db: Session) -> int:
         Number of workers awarded the streak bonus.
     """
     from app.models.issue import Issue
-    from app.models.user import User
 
-    one_week_ago = datetime.utcnow() - timedelta(days=7)
+    one_week_ago = now_utc() - timedelta(days=7)
     count = 0
 
     try:
@@ -511,8 +581,21 @@ def check_weekly_streaks(db: Session) -> int:
                 for issue in recent_active_issues
             )
             if not rejected_this_week:
-                award_event(db, worker.id, "weekly_streak",
-                            note="Zero rejections this week — streak bonus!")
+                # Keyed to the ISO week so re-running the job cannot pay twice.
+                #
+                # This had no reference_id at all, which skips the idempotency
+                # check entirely (`if reference_id:`). The only thing preventing
+                # a second payout was `last_streak_date`, a variable held in the
+                # jobs process's memory — so every restart or redeploy on a
+                # Sunday re-awarded every eligible worker.
+                iso = now_utc().isocalendar()
+                award_event(
+                    db, worker.id, "weekly_streak",
+                    reference_id=reference_for_period(
+                        "weekly_streak", worker.id, f"{iso.year}-W{iso.week:02d}"
+                    ),
+                    note="Zero rejections this week — streak bonus!",
+                )
                 count += 1
     except Exception as e:
         logger.error(f"Weekly streak check error: {e}", exc_info=True)

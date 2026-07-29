@@ -5,7 +5,6 @@ Pydantic response models for the rewards system.
 These are used by /me/rewards, /leaderboard/*, and /badges endpoints.
 """
 
-from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel

@@ -1,17 +1,22 @@
 """Email Service — Worker Invitations & Password Resets
 =======================================================
 
-Sends HTML and plaintext emails via SMTP. In DEV_MODE or when SMTP_HOST
-is not configured, logs email content to console instead of sending.
+Sends HTML and plaintext emails via SMTP. With ``EMAIL_BACKEND="console"`` the
+message is logged instead of sent.
 
 Main function:
     send_worker_invitation(to_email, worker_name, phone, temp_password) -> bool
 
-Returns True on success, False on failure. Failures do not block the API endpoint.
+Returns True on success, False on failure. A missing SMTP configuration is a
+failure, not a success — the caller needs to know the worker never received
+their credentials.
+
+Temporary passwords are never written to the log. Log files are retained for 30
+days and the Sentry logging integration ships INFO-level records as breadcrumbs,
+so a password logged here outlives and outruns the email it came from.
 """
 
-from datetime import datetime
-import re
+from app.core.time import now_utc
 from app.core.config import settings
 from app.core.logger import get_logger
 
@@ -33,35 +38,37 @@ async def send_worker_invitation(
         temp_password: Temporary password (included in email).
 
     Returns:
-        True on success (or in DEV_MODE/no SMTP config), False on failure.
+        True if the email was sent (or logged by the console backend), False on
+        failure — including when SMTP is not configured.
 
-    In DEV_MODE:
-        - Logs the email content and temp password to console.
-        - Returns True (pretends email was sent for dev purposes).
+    With ``EMAIL_BACKEND="console"`` the message is logged and the password is
+    redacted. The caller receives the plaintext password back and is responsible
+    for surfacing it; see ``POST /admin/workers``.
     """
 
-    # DEV_MODE: log to console and return success
-    if settings.DEV_MODE:
+    if settings.EMAIL_BACKEND == "console":
         logger.info(
-            f"[DEV MODE] Worker invitation email (not actually sent):\n"
+            f"[console] Worker invitation email (not actually sent):\n"
             f"  To: {to_email}\n"
             f"  Phone: {phone}\n"
-            f"  Temp Password: {temp_password}\n"
+            f"  Temp Password: ***redacted — returned in the API response***\n"
             f"  Expires: {_format_expiry_date()}"
         )
         return True
 
-    # Missing SMTP config: log warning and return success (non-blocking)
+    # Previously this returned True, so POST /admin/workers answered 201 while
+    # the worker never received anything and the only copy of their password was
+    # a log line.
     if not settings.SMTP_HOST:
-        logger.warning(
-            f"SMTP_HOST not configured. Cannot send worker invitation email to {to_email}. "
-            f"Temp password: {temp_password}"
+        logger.error(
+            "SMTP_HOST is not configured — cannot send the worker invitation to %s",
+            to_email,
         )
-        return True
+        return False
 
     try:
         import aiosmtplib
-    except ImportError as exc:
+    except ImportError:
         logger.error(
             "aiosmtplib is not installed. Cannot send email.",
             exc_info=True,
@@ -122,7 +129,7 @@ async def send_worker_invitation(
                 "smtp_host": settings.SMTP_HOST,
                 "smtp_port": settings.SMTP_PORT,
                 "recipient_email": to_email,
-                "dev_mode": settings.DEV_MODE,
+                "email_backend": settings.EMAIL_BACKEND,
             },
             exc_info=True
         )
@@ -299,5 +306,5 @@ def _format_expiry_date() -> str:
     """Return the 7-day expiry date in a readable format."""
     from datetime import timedelta
 
-    expiry = datetime.utcnow() + timedelta(days=7)
+    expiry = now_utc() + timedelta(days=7)
     return expiry.strftime("%B %d, %Y")

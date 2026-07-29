@@ -8,7 +8,7 @@ Key design points:
 - Every notification is always persisted to the DB regardless of push outcome.
 - FCM push is best-effort — failure is logged but does not raise exceptions.
 - Supports multilingual messages (English, Hindi, Gujarati) via template keys.
-- In DEV_MODE, FCM pushes are only logged to console (no real Firebase calls).
+- With PUSH_BACKEND="console", FCM pushes are only logged (no Firebase calls).
 
 Usage:
     # Direct message (title + body already known):
@@ -20,16 +20,16 @@ Usage:
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.time import now_utc
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.models.notification import Notification
-from app.services.utils import get_active_user_or_404
 
 logger = get_logger("notification")
 
@@ -227,11 +227,11 @@ def notify(
             Notification.user_id == user_id,
             Notification.issue_id == issue_id,
             Notification.type == "assignment",
-            Notification.created_at >= (datetime.utcnow() - timedelta(seconds=5))  # Within 5 seconds
+            Notification.created_at >= (now_utc() - timedelta(seconds=5))  # Within 5 seconds
         ).first()
         if existing:
             logger.info(
-                f"Duplicate notification prevented (idempotency)",
+                "Duplicate notification prevented (idempotency)",
                 extra={"user_id": user_id, "issue_id": issue_id, "type": notification_type}
             )
             return existing
@@ -393,8 +393,9 @@ def notify_ward_subscribers(
 def _send_fcm(token: str, title: str, body: str, data: Optional[dict] = None) -> bool:
     """Send a push notification via Firebase Cloud Messaging (FCM v1 API).
 
-    In DEV_MODE, only logs to console without making real Firebase calls.
-    Failure is silently logged — callers are not affected.
+    With ``PUSH_BACKEND="console"``, only logs without calling Firebase.
+    Failure is logged and returned — callers are not blocked, because the
+    notification row is written to the database first either way.
 
     Args:
         token: Target device FCM registration token.
@@ -403,10 +404,10 @@ def _send_fcm(token: str, title: str, body: str, data: Optional[dict] = None) ->
         data:  Optional key-value data payload (all values must be strings).
 
     Returns:
-        True on success (or dev mode), False on failure.
+        True on success (or with the console backend), False on failure.
     """
-    if settings.DEV_MODE:
-        logger.info(f"[DEV] FCM push → '{title}': {body}")
+    if settings.PUSH_BACKEND == "console":
+        logger.info(f"[console] FCM push → '{title}': {body}")
         return True
 
     if not _init_firebase():
@@ -466,9 +467,15 @@ def send_sms_status_update(
     lang = lang if lang in ("en", "hi", "gu") else "en"
     message = template.get(lang, template["en"]).format(**kwargs)
 
-    if settings.DEV_MODE or not settings.MSG91_API_KEY:
-        logger.info(f"[DEV] SMS → {phone}: {message}")
+    if settings.SMS_BACKEND == "console":
+        logger.info(f"[console] SMS → {phone}: {message}")
         return True
+
+    # Not `return True`: an unconfigured MSG91 means the status update was never
+    # delivered, and the caller should be able to tell that from the return value.
+    if not settings.MSG91_API_KEY or not settings.MSG91_TEMPLATE_ID:
+        logger.error("MSG91 is not configured — cannot send status SMS to %s", phone)
+        return False
 
     try:
         import httpx
