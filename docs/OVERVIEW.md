@@ -8,7 +8,7 @@ Your Civic project now has a comprehensive, production-ready architecture with c
 
 ## 📖 Your Documentation Library
 
-### **🚀 START HERE** → [START_HERE.md](START_HERE.md)
+### **🚀 START HERE** → `README.md` in the repository root
 Your navigation hub for all documentation and guides. Start here!
 
 ### **📌 Quick Reference** → [QUICK_REFERENCE.md](QUICK_REFERENCE.md)  
@@ -16,33 +16,31 @@ One-page cheat sheet. Print it or bookmark it.
 
 ### **📄 Core Documentation** (Read in Order)
 
-1. **[README_IMPROVEMENTS.md](README_IMPROVEMENTS.md)** ⏱️ 2 min
+1. **the repository `README.md`** ⏱️ 2 min
    - Quick overview of everything
    - What was accomplished
    - Key metrics
    - Best for: Getting oriented quickly
 
-2. **[COMPLETION_STATUS.md](COMPLETION_STATUS.md)** ⏱️ 10 min
    - Complete breakdown of all work
    - Architecture details
    - Success criteria
    - Best for: Understanding full scope
 
-3. **[IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md)** ⏱️ 20 min
+3. **the repository `README.md`** ⏱️ 20 min
    - Technical deep-dive
    - Backend architecture
    - Frontend infrastructure
    - Code examples
    - Best for: Technical leads and architects
 
-4. **[civic-frontend/FRONTEND_IMPROVEMENTS.md](civic-frontend/FRONTEND_IMPROVEMENTS.md)** ⏱️ 15 min
+4. **`admin/INTEGRATION_GUIDE.md` and `mobile/INTEGRATION_GUIDE.md`** ⏱️ 15 min
    - Implementation guide
    - How to use each feature
    - Integration steps
    - Testing examples
    - Best for: Frontend developers
 
-5. **[FILE_REFERENCE.md](FILE_REFERENCE.md)** ⏱️ 5 min
    - All files and their locations
    - Function signatures
    - Quick lookup for "where is X?"
@@ -95,24 +93,21 @@ One-page cheat sheet. Print it or bookmark it.
 ## 🎯 How to Use This
 
 ### Step 1: Understand (5-10 minutes)
-1. Open [START_HERE.md](START_HERE.md)
 2. Find your role in the documentation map
-3. Read the 2-min overview: [README_IMPROVEMENTS.md](README_IMPROVEMENTS.md)
+3. Read the 2-min overview: the repository `README.md`
 
 ### Step 2: Deep Dive (20-30 minutes)
-1. Read [COMPLETION_STATUS.md](COMPLETION_STATUS.md) for full context
-2. OR read [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md) for technical details
-3. OR read [civic-frontend/FRONTEND_IMPROVEMENTS.md](civic-frontend/FRONTEND_IMPROVEMENTS.md) if you're a frontend dev
+2. OR read the repository `README.md` for technical details
+3. OR read `admin/INTEGRATION_GUIDE.md` and `mobile/INTEGRATION_GUIDE.md` if you're a frontend dev
 
 ### Step 3: Implement (2-3 hours)
 1. Copy utility files from `admin/src/` and `mobile/src/`
-2. Follow integration checklist in FRONTEND_IMPROVEMENTS.md
+2. Follow integration checklist in `admin/INTEGRATION_GUIDE.md`
 3. Update your API client
 4. Test everything
 
 ### Step 4: Reference (ongoing)
 1. Bookmark [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
-2. Use [FILE_REFERENCE.md](FILE_REFERENCE.md) to find things
 3. Check code comments (JSDoc on all functions)
 
 ---
@@ -120,23 +115,23 @@ One-page cheat sheet. Print it or bookmark it.
 ## 👥 By Role
 
 ### 👔 Project Manager  
-→ [README_IMPROVEMENTS.md](README_IMPROVEMENTS.md) (2 min)
+→ the repository `README.md` (2 min)
 
 ### 👨‍💼 Technical Lead  
-→ [COMPLETION_STATUS.md](COMPLETION_STATUS.md) (10 min)  
-→ [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md) (20 min)
+→ the repository `README.md` (10 min)  
+→ the repository `README.md` (20 min)
 
 ### 👨‍💻 Backend Developer  
-→ [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md) (backend section)  
+→ the repository `README.md` (backend section)  
 → Check `app/services/utils.py` and `app/core/`
 
 ### 🎨 Frontend Developer  
-→ [civic-frontend/FRONTEND_IMPROVEMENTS.md](civic-frontend/FRONTEND_IMPROVEMENTS.md) (15 min)  
+→ `admin/INTEGRATION_GUIDE.md` and `mobile/INTEGRATION_GUIDE.md` (15 min)  
 → Copy files from `admin/src/` or `mobile/src/`
 
 ### 🧪 QA/Tester  
-→ Testing sections in [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md)  
-→ Testing section in [civic-frontend/FRONTEND_IMPROVEMENTS.md](civic-frontend/FRONTEND_IMPROVEMENTS.md)
+→ Testing sections in the repository `README.md`  
+→ Testing section in `admin/INTEGRATION_GUIDE.md` and `mobile/INTEGRATION_GUIDE.md`
 
 ---
 
@@ -176,13 +171,10 @@ import { useLoading, useErrorNotification } from '@/store/uiStore';
 
 | Document | Length | Content | Best For |
 |----------|--------|---------|----------|
-| START_HERE.md | 1 page | Navigation & checklists | Finding what you need |
 | QUICK_REFERENCE.md | 1 page | Cheat sheet | Quick lookup |
 | README_IMPROVEMENTS.md | 2 pages | Executive summary | Managers |
-| COMPLETION_STATUS.md | 5 pages | Complete breakdown | Leaders & architects |
-| IMPROVEMENTS_SUMMARY.md | 10 pages | Technical details | Engineers & architects |
-| FRONTEND_IMPROVEMENTS.md | 5 pages | Implementation guide | Frontend developers |
-| FILE_REFERENCE.md | 4 pages | File locations & usage | Finding things |
+| the repository `README.md` | 10 pages | Technical details | Engineers & architects |
+| `admin/INTEGRATION_GUIDE.md` | 5 pages | Implementation guide | Frontend developers |
 
 **Total Reading Material**: ~30 pages (but you don't need to read all!)
 
@@ -209,7 +201,6 @@ import { useLoading, useErrorNotification } from '@/store/uiStore';
 ## 🚀 Next Steps
 
 ### This Week
-1. ✅ Read [START_HERE.md](START_HERE.md) and your role guide
 2. ✅ Schedule team review
 3. ✅ Plan integration timeline
 4. ✅ Assign team members
@@ -232,10 +223,8 @@ import { useLoading, useErrorNotification } from '@/store/uiStore';
 
 **For Complete Understanding (45 min)**
 1. README_IMPROVEMENTS.md (2 min)
-2. COMPLETION_STATUS.md (10 min)
-3. FILE_REFERENCE.md (5 min)
-4. IMPROVEMENTS_SUMMARY.md (15 min)
-5. FRONTEND_IMPROVEMENTS.md (13 min)
+4. the repository `README.md` (15 min)
+5. `admin/INTEGRATION_GUIDE.md` (13 min)
 
 **For Implementation (2-3 hours)**
 1. Copy 4 files to project
@@ -249,9 +238,7 @@ import { useLoading, useErrorNotification } from '@/store/uiStore';
 ## 💡 Pro Tips
 
 ### Tip 1: Bookmark These
-- [START_HERE.md](START_HERE.md) - Your index
 - [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Your cheat sheet
-- [FILE_REFERENCE.md](FILE_REFERENCE.md) - Your lookup tool
 
 ### Tip 2: Check the Code
 All files have JSDoc comments with examples:
@@ -268,7 +255,7 @@ export function getErrorMessage(error) { ... }
 ```
 
 ### Tip 3: Use the Checklists
-See FRONTEND_IMPROVEMENTS.md Section 7 for implementation checklist
+See `admin/INTEGRATION_GUIDE.md` for implementation checklist
 
 ### Tip 4: Run the Tests
 All test examples are in the documentation
@@ -277,10 +264,8 @@ All test examples are in the documentation
 
 ## 📞 Support
 
-**Question?** → Check [START_HERE.md](START_HERE.md) (has troubleshooting)  
-**What file?** → Check [FILE_REFERENCE.md](FILE_REFERENCE.md)  
 **How to use?** → Check code comments with examples  
-**Testing?** → Check IMPROVEMENTS_SUMMARY.md or FRONTEND_IMPROVEMENTS.md  
+**Testing?** → Check the repository `README.md` or `admin/INTEGRATION_GUIDE.md`  
 
 ---
 
@@ -307,7 +292,6 @@ All test examples are in the documentation
 
 Everything is complete and documented. Your team can start integrating immediately.
 
-**Next Step**: Open [START_HERE.md](START_HERE.md)
 
 ---
 
