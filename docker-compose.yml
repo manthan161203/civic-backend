@@ -247,6 +247,18 @@ services:
       LOG_TO_FILE: "false"
       LOG_LEVEL: WARNING
       PUBLIC_BASE_URL: http://testserver
+    # Bind-mount the source so a test run reflects the working tree.
+    #
+    # Without this the service runs whatever was baked into the image at the
+    # last `docker compose build`, so editing a file and re-running the suite
+    # silently tests the *old* code — and it passes, which is the worst possible
+    # failure mode for a test harness. Only `tests` gets this; `api` deliberately
+    # keeps running the built image so it stays representative of a deploy.
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
+      - ./alembic:/app/alembic:ro
+      - ./pytest.ini:/app/pytest.ini:ro
     command: ["pytest"]
     depends_on:
       testdb:

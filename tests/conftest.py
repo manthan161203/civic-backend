@@ -29,6 +29,7 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 # Settings must be import-safe before anything pulls in app.core.config.
@@ -56,11 +57,38 @@ from app.models.user import User  # noqa: E402
 
 @pytest.fixture(scope="session")
 def engine():
-    """Session-wide engine, with the schema created once."""
+    """Session-wide engine, with the schema rebuilt from the models.
+
+    ``create_all`` is a no-op on a table that already exists — it never issues
+    ``ALTER``. Because the test database lives in a persistent volume, that made
+    a stale schema invisible: adding a column to a model left the old table in
+    place, and the suite reported green while testing against a shape the code
+    no longer had. The failure that surfaces is a raw ``UndefinedColumn`` from
+    psycopg2 in whichever test happens to insert first, which points nowhere
+    near the actual cause.
+
+    Dropping first makes the schema a pure function of the models, which is the
+    property the rest of this file already assumes.
+
+    Migrations are still verified separately (``alembic upgrade head`` +
+    ``alembic check``) — nothing here exercises them, so a correct model with a
+    missing migration passes this suite and fails a deploy.
+    """
+    # Refuse to do this to anything that is not obviously a scratch database.
+    # TEST_DATABASE_URL comes from the environment, and a drop_all against a
+    # developer's real database would be unrecoverable.
+    db_name = make_url(TEST_DATABASE_URL).database or ""
+    if "test" not in db_name.lower():
+        raise RuntimeError(
+            f"Refusing to rebuild the schema in database {db_name!r}: the suite "
+            "drops every table, so TEST_DATABASE_URL must name a test database."
+        )
+
     eng = create_engine(TEST_DATABASE_URL, pool_pre_ping=True)
     # Import every model so Base.metadata is complete before create_all.
     import app.models  # noqa: F401
 
+    Base.metadata.drop_all(bind=eng)
     Base.metadata.create_all(bind=eng)
     yield eng
     eng.dispose()
