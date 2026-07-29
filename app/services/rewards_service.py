@@ -325,28 +325,55 @@ def get_user_summary(db: Session, user_id: uuid.UUID) -> dict:
     }
 
 
-def get_leaderboard(db: Session, role: str = "citizen", limit: int = 10, offset: int = 0) -> list:
+def get_leaderboard(
+    db: Session,
+    role: str = "citizen",
+    limit: int = 10,
+    offset: int = 0,
+    days: Optional[int] = None,
+) -> list:
     """Return top users ranked by total points for a given role.
 
     Args:
-        db:    SQLAlchemy session.
-        role:  ``"citizen"`` or ``"worker"``.
-        limit: Number of top entries to return.
+        db:     SQLAlchemy session.
+        role:   ``"citizen"`` or ``"worker"``.
+        limit:  Number of top entries to return.
+        offset: Number of entries to skip.
+        days:   Restrict to points earned in the last N days. ``None`` means
+                all-time, which is the historical behaviour and stays the
+                default. Follows the naming already used by
+                ``GET /public/leaderboard``.
 
     Returns:
         List of dicts with rank, user_id, name, total_points, level, badges.
+
+    Note:
+        ``level`` and ``badges`` remain **lifetime** figures even when ``days``
+        is set — a badge earned last year is not un-earned by asking for this
+        week's ranking. Only ``total_points``, and for workers ``tasks_completed``
+        and ``avg_rating``, respect the window. Mixing the two would produce a
+        row claiming Level 4 with 30 points.
     """
     from app.models.reward import RewardTransaction, UserBadge
     from app.models.user import User
 
-    rows = (
+    cutoff = now_utc() - timedelta(days=days) if days else None
+
+    points_q = (
         db.query(
             RewardTransaction.user_id,
             func.sum(RewardTransaction.points).label("total_points"),
         )
         .join(User, User.id == RewardTransaction.user_id)
         .filter(User.role == role, User.is_active == True)
-        .group_by(RewardTransaction.user_id)
+    )
+    if cutoff is not None:
+        # RewardTransaction.created_at is timezone-aware and indexed, so this
+        # narrows on the index rather than scanning.
+        points_q = points_q.filter(RewardTransaction.created_at >= cutoff)
+
+    rows = (
+        points_q.group_by(RewardTransaction.user_id)
         .order_by(func.sum(RewardTransaction.points).desc())
         .offset(offset)
         .limit(limit)
@@ -374,19 +401,20 @@ def get_leaderboard(db: Session, role: str = "citizen", limit: int = 10, offset:
     rating_map = {}
     if role == "worker" and user_ids:
         from app.models.issue import Issue
-        task_rows = (
-            db.query(
-                Issue.assigned_worker_id,
-                func.count(Issue.id),
-                func.avg(Issue.citizen_rating),
-            )
-            .filter(
-                Issue.assigned_worker_id.in_(user_ids),
-                Issue.status.in_(["resolved", "closed"]),
-            )
-            .group_by(Issue.assigned_worker_id)
-            .all()
+        task_q = db.query(
+            Issue.assigned_worker_id,
+            func.count(Issue.id),
+            func.avg(Issue.citizen_rating),
+        ).filter(
+            Issue.assigned_worker_id.in_(user_ids),
+            Issue.status.in_(["resolved", "closed"]),
         )
+        if cutoff is not None:
+            # Status carries no date, so the window keys on when the work was
+            # actually finished. Without this the two halves of a row disagree:
+            # points for the last 7 days beside a lifetime task count.
+            task_q = task_q.filter(Issue.resolved_at >= cutoff)
+        task_rows = task_q.group_by(Issue.assigned_worker_id).all()
         tasks_map  = {r[0]: r[1] for r in task_rows}
         rating_map = {r[0]: round(float(r[2]), 1) if r[2] else None for r in task_rows}
 

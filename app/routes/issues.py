@@ -1245,14 +1245,20 @@ def update_issue(
 
     - **Citizens**: can set ``citizen_rating`` on their own resolved issues.
     - **Workers/Admins**: can update ``status`` and ``resolution_notes``.
-    - **Admins only**: can set ``assigned_worker_id`` (triggers reassignment to ``assigned`` status).
+    - **Admins only**: can set ``assigned_worker_id`` (triggers reassignment to
+      ``assigned`` status), ``priority`` and ``department``.
+
+    Fields a caller is not entitled to set are ignored rather than rejected,
+    matching how ``assigned_worker_id`` has always behaved here.
 
     Returns:
         Updated ``IssueResponse``.
 
     Raises:
-        403: Citizen trying to update another user's issue.
+        403: Citizen updating another user's issue; worker updating a task that
+             is not theirs; scoped admin acting outside their jurisdiction.
         404: Issue not found.
+        422: Unknown ``priority`` or ``department`` value.
     """
     issue = db.query(Issue).filter(Issue.id == issue_id, Issue.is_deleted == False).first()
     if not issue:
@@ -1304,6 +1310,24 @@ def update_issue(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="This issue is outside your administrative jurisdiction",
                 )
+
+        # Re-triage. Both fields were declared on IssueUpdate, documented, and
+        # enum-validated, but never read here — so an admin re-prioritising an
+        # issue got 200 OK and no write.
+        #
+        # This runs *before* the status branch below on purpose: that branch
+        # reads `issue.priority` to decide whether an after-photo is required,
+        # and evaluating that guard against the value being replaced would be
+        # wrong the moment the two are changed in one request.
+        if is_scoped_admin:
+            if body.priority is not None:
+                issue.priority = body.priority.value
+            if body.department is not None:
+                # `department` feeds worker auto-assignment matching, so an
+                # already-assigned worker is now matched on the old department.
+                # Reassigning here would pull a task out from under someone
+                # mid-job; that call is left to the admin, deliberately.
+                issue.department = body.department.value
 
         if current_user.role == "worker" or is_scoped_admin:
             if body.status is not None:

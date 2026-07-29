@@ -102,13 +102,21 @@ class IssueUpdate(BaseModel):
     Role-based field restrictions:
     - **Citizens**: can only set ``citizen_rating`` on their own resolved issues.
     - **Workers/Admins**: can update ``status`` and ``resolution_notes``.
-    - **Admins only**: can set ``assigned_worker_id`` (triggers reassignment).
+    - **Admins only**: can set ``assigned_worker_id`` (triggers reassignment),
+      ``priority`` and ``department``.
+
+    Fields the caller is not entitled to set are ignored rather than rejected.
 
     Attributes:
         status:             New status value.
         resolution_notes:   Notes from the worker about the resolution.
         assigned_worker_id: UUID of the worker to assign (admin only).
         citizen_rating:     Satisfaction rating 1-5 (citizen only, on resolved issues).
+        priority:           Re-triaged priority (admin only). Applied before any
+                            status change in the same request, because the
+                            after-photo requirement is keyed on it.
+        department:         Owning department (admin only). Changing it does not
+                            reassign an already-assigned worker.
     """
 
     status: Optional[IssueStatusEnum] = Field(None, description="open | assigned | in_progress | resolved | closed")
@@ -129,17 +137,48 @@ class IssueUpdate(BaseModel):
 class IssueReporterInfo(BaseModel):
     """Embedded reporter info within ``IssueResponse``.
 
+    **This deliberately carries no phone number.**
+
+    ``IssueResponse`` is ``from_attributes`` over a model with a ``reporter``
+    relationship, so every one of its 24 ``model_validate`` call sites populates
+    this object automatically. While ``phone`` lived here, two of those sites
+    published it to any authenticated citizen:
+
+    * ``GET /issues/nearby`` — a **list**, keyed on a caller-supplied
+      coordinate, so no issue id had to be guessed;
+    * ``GET /issues/{id}`` — whose own docstring says citizens may view any
+      issue; the one access check there restricts workers.
+
+    Admins have a genuine need for it — they call citizens back about their
+    reports — so it moved to :class:`IssueReporterAdminInfo`, reachable only via
+    :class:`IssueAdminResponse` on routes that opt in. Keeping the narrow shape
+    as the default means a route added later leaks nothing by omission, which is
+    not a property that stripping the field at each call site could offer.
+
     Attributes:
         id:    Reporter's user UUID.
         name:  Reporter's display name.
-        phone: Reporter's phone number.
     """
 
     id: UUID
     name: Optional[str] = None
-    phone: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+
+class IssueReporterAdminInfo(IssueReporterInfo):
+    """Reporter info including the phone number. Admin responses only.
+
+    Reachable only through :class:`IssueAdminResponse`. FastAPI serialises
+    against the declared ``response_model``, so returning one of these from a
+    route that declares plain ``IssueResponse`` drops the phone rather than
+    leaking it — the failure mode points the safe way.
+
+    Attributes:
+        phone: Reporter's phone number.
+    """
+
+    phone: Optional[str] = None
 
 
 class IssueCommentCreate(BaseModel):
@@ -365,3 +404,30 @@ class IssueListResponse(BaseModel):
         total = values.get("total") or 0
         values["pages"] = math.ceil(total / size) if size else 0
         return values
+
+
+class IssueAdminResponse(IssueResponse):
+    """``IssueResponse`` plus the reporter's phone number.
+
+    Declared as the ``response_model`` on the admin issue routes. It exists so
+    that the *default* response shape is the safe one: any route that does not
+    explicitly ask for this variant cannot emit a phone number, because
+    :class:`IssueReporterInfo` has no such field to emit.
+
+    Nothing else differs — see the sibling test asserting this stays a strict
+    superset, so the two shapes cannot quietly drift apart.
+    """
+
+    reporter: Optional[IssueReporterAdminInfo] = None
+
+
+class IssueAdminListResponse(IssueListResponse):
+    """Paginated admin issue list.
+
+    Inherits the ``mode="before"`` validator that reconciles ``page``/``size``
+    with ``limit``/``offset`` — subclassing keeps it, and a test pins that,
+    because losing it would silently return every admin list to reporting
+    ``limit: 50, offset: 0`` on every page.
+    """
+
+    items: List[IssueAdminResponse]

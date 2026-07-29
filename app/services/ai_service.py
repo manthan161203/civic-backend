@@ -348,6 +348,73 @@ def build_dynamic_context(user_message: str, current_user, db, base_context: str
     return context
 
 
+INSIGHTS_SYSTEM_PROMPT = """You are a municipal operations analyst.
+
+You will be given a JSON summary of civic issue statistics for one
+administrative area. Write 2-4 short sentences for the administrator who runs
+that area.
+
+Rules:
+- Only state things the numbers support. Do not speculate about causes.
+- Do not invent figures. Every number you mention must appear in the input.
+- Lead with whatever most needs attention. If nothing does, say so plainly.
+- No preamble, no headings, no bullet points. Plain prose.
+- If the data is too sparse to say anything useful, say exactly that."""
+
+
+def summarise_insights(payload: dict) -> Optional[str]:
+    """Turn the aggregate insight payload into a short written summary.
+
+    The numbers are computed in SQL and are correct without this; the summary is
+    a convenience laid on top. It is therefore written to fail quietly — the
+    caller drops it into an already-complete response, so an outage costs the
+    prose and nothing else.
+
+    Args:
+        payload: The dict built by ``GET /admin/insights``.
+
+    Returns:
+        The summary, or ``None`` if no provider is configured or the model
+        returned nothing usable.
+    """
+    if not settings.GROQ_API_KEY:
+        return None
+
+    # Only the aggregates are sent. No issue text, no addresses, no reporter
+    # identifiers — nothing here identifies a person, so the summary cannot leak
+    # one however the model behaves.
+    facts = {
+        "period_days": payload.get("period_days"),
+        "ai_quality": payload.get("ai_quality"),
+        "throughput": payload.get("throughput"),
+        # Only the movements worth mentioning, so the model is not invited to
+        # narrate a category that went from 2 to 3.
+        "notable_movement": [m for m in payload.get("movement", []) if m.get("notable")][:5],
+        "anomalies": payload.get("anomalies", [])[:5],
+    }
+
+    model = ChatGroq(
+        model=settings.GROQ_MODEL,
+        temperature=0.2,  # a report, not prose — keep it close to the numbers
+        api_key=settings.GROQ_API_KEY,
+        timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+        max_tokens=settings.AI_MAX_TOKENS,
+        max_retries=1,
+    )
+
+    try:
+        response = model.invoke([
+            {"role": "system", "content": INSIGHTS_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(facts, default=str)},
+        ])
+        text = (response.content or "").strip()
+        logger.debug("Insight narrative generated (%d chars)", len(text))
+        return text or None
+    except Exception as e:
+        logger.warning(f"Insight narrative generation failed: {e}")
+        return None
+
+
 def chat_response(user_message: str, issue_context: str = "", db=None) -> str:
     """Generate a multilingual civic assistant reply using Groq.
 

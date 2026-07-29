@@ -144,6 +144,14 @@ class CreateGeofenceRequest(BaseModel):
     longitude: float = Field(..., ge=-180, le=180, description="Longitude (-180 to 180)")
     radius_km: float = Field(..., gt=0, le=MAX_GEOFENCE_RADIUS_KM, description=f"Radius in km (0.1 to {MAX_GEOFENCE_RADIUS_KM:g})")
 
+    # Jurisdiction. Honoured only for a super-admin: a scoped admin always gets
+    # their own scope, whatever they send here, so the field cannot be used to
+    # create a zone outside the caller's authority. Leave all three unset as a
+    # super-admin to create a state-level zone.
+    ward_id: Optional[UUID] = Field(None, description="Owning ward (super-admin only)")
+    taluka_id: Optional[UUID] = Field(None, description="Owning taluka (super-admin only)")
+    district_id: Optional[UUID] = Field(None, description="Owning district (super-admin only)")
+
     @validator('name')
     def name_not_blank(cls, v):
         if not v or not v.strip():
@@ -197,6 +205,11 @@ class GeofenceResponse(BaseModel):
     radius_km: float = Field(..., description="Radius in kilometers")
     created_by_name: Optional[str] = Field(None, description="Name of admin who created this geofence")
     created_at: datetime = Field(..., description="Creation timestamp")
+    # All three null means state-level — manageable only by a super-admin. The
+    # console needs these to show which zones a scoped admin can actually edit.
+    ward_id: Optional[UUID] = Field(None, description="Owning ward, if any")
+    taluka_id: Optional[UUID] = Field(None, description="Owning taluka, if any")
+    district_id: Optional[UUID] = Field(None, description="Owning district, if any")
 
     class Config:
         from_attributes = True

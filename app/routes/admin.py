@@ -19,6 +19,7 @@ Frontend Integration Notes:
 - Heatmap data returns lat/lng/weight for map visualization libraries.
 """
 
+import math
 import re
 import secrets
 import uuid
@@ -33,6 +34,8 @@ from sqlalchemy import func
 from app.core.time import now_utc
 from app.services.geofence_utils import (
     check_geofences_intersect,
+    haversine_distance,
+    point_in_geofence,
     validate_geofence_radius,
     validate_geofence_area,
 )
@@ -45,6 +48,7 @@ from app.services.email_service import send_worker_invitation
 from app.database import get_db
 from app.models.announcement import Announcement
 from app.models.geofence import Geofence
+from app.models.geofence_alert import GeofenceAlert
 from app.models.issue import Issue
 from app.models.issue_flag import IssueFlag
 from app.models.location import Taluka, Ward
@@ -56,7 +60,10 @@ from app.schemas.admin import (
     UpdateGeofenceRequest, WorkerInvitationResult
 )
 from app.schemas.auth import UserResponse
-from app.schemas.issue import IssueListResponse, IssueResponse
+# Admins get the variants carrying the reporter's phone number. Every other
+# router uses the plain IssueResponse, which has no phone field to emit — see
+# the docstring on IssueReporterInfo.
+from app.schemas.issue import IssueAdminListResponse, IssueAdminResponse
 from app.services.utils import (
     apply_not_deleted_filter,
     apply_active_filter,
@@ -130,7 +137,7 @@ def get_dashboard(
 
 # ── Issues ────────────────────────────────────────────────────────────────────
 
-@router.get("/issues", response_model=IssueListResponse)
+@router.get("/issues", response_model=IssueAdminListResponse)
 def list_all_issues(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=200),
@@ -140,13 +147,32 @@ def list_all_issues(
     severity: Optional[str] = Query(None),
     priority: Optional[str] = Query(None, description="Filter by priority: urgent/high/medium/low"),
     department: Optional[str] = Query(None, description="Filter by department"),
+    ai_flag: Optional[str] = Query(
+        None,
+        description="Drill-down for the insights screen: low_confidence | poor_resolution",
+    ),
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
     """List all issues in the admin's scope with optional filters (paginated).
 
+    ``ai_flag`` exists so the AI-insights screen can page its drill-down lists
+    server-side. It previously fetched up to 2,000 issues and filtered them in
+    the browser, which both truncated the result and made the counts a sample.
+
     **Roles**: any admin.
     """
+    # Validated before the try: the handler's `except Exception` turns anything
+    # raised inside into a 500, so a deliberate 422 raised in there would reach
+    # the client as "Failed to fetch issues".
+    if ai_flag is not None and ai_flag not in ("low_confidence", "poor_resolution"):
+        # Not silently ignored — an unrecognised value returning the unfiltered
+        # list would show every issue under a "low confidence" tab.
+        raise HTTPException(
+            status_code=422,
+            detail="ai_flag must be 'low_confidence' or 'poor_resolution'",
+        )
+
     try:
         query = apply_admin_scope(db.query(Issue), current_user, Issue)
         query = apply_not_deleted_filter(query)
@@ -163,6 +189,12 @@ def list_all_issues(
             query = query.filter(Issue.priority == priority)
         if department:
             query = query.filter(Issue.department == department)
+        if ai_flag == "low_confidence":
+            query = query.filter(
+                Issue.ai_confidence.isnot(None), Issue.ai_confidence < AI_LOW_CONFIDENCE
+            )
+        elif ai_flag == "poor_resolution":
+            query = query.filter(Issue.ai_resolution_quality == "poor")
 
         total = query.count()
         items = query.order_by(Issue.created_at.desc(), Issue.id.desc()).offset((page - 1) * size).limit(size).all()
@@ -170,13 +202,13 @@ def list_all_issues(
         logger.error(f"Error listing issues: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch issues.")
 
-    return IssueListResponse(
-        items=[IssueResponse.model_validate(i) for i in items],
+    return IssueAdminListResponse(
+        items=[IssueAdminResponse.model_validate(i) for i in items],
         total=total, page=page, size=size,
     )
 
 
-@router.post("/issues/{issue_id}/reassign", response_model=IssueResponse)
+@router.post("/issues/{issue_id}/reassign", response_model=IssueAdminResponse)
 def reassign_worker(
     issue_id: uuid.UUID,
     body: AssignWorker,
@@ -264,10 +296,10 @@ def reassign_worker(
         f"Admin {current_user.id} reassigned issue {issue_id} from {old_worker_id} to {worker.id}",
         extra={"old_worker_id": str(old_worker_id), "new_worker_id": str(worker.id), "active_tasks": active_task_count}
     )
-    return IssueResponse.model_validate(issue)
+    return IssueAdminResponse.model_validate(issue)
 
 
-@router.post("/issues/{issue_id}/unblock", response_model=IssueResponse)
+@router.post("/issues/{issue_id}/unblock", response_model=IssueAdminResponse)
 def unblock_task(
     issue_id: uuid.UUID,
     admin_notes: str = Query(..., min_length=1, max_length=500, description="Why task is being unblocked"),
@@ -326,10 +358,10 @@ def unblock_task(
         logger.error(f"Error unblocking issue {issue_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to unblock task")
     
-    return IssueResponse.model_validate(issue)
+    return IssueAdminResponse.model_validate(issue)
 
 
-@router.get("/blocked-tasks", response_model=IssueListResponse)
+@router.get("/blocked-tasks", response_model=IssueAdminListResponse)
 def list_blocked_tasks(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -363,16 +395,16 @@ def list_blocked_tasks(
     # Enrich with block duration
     responses = []
     for issue in issues:
-        resp = IssueResponse.model_validate(issue)
+        resp = IssueAdminResponse.model_validate(issue)
         if issue.blocked_at:
             blocked_duration = (datetime.now(timezone.utc) - issue.blocked_at).total_seconds() / 3600
             resp.blocked_duration_hours = round(blocked_duration, 1)
         responses.append(resp)
     
-    return IssueListResponse(items=responses, total=total, limit=limit, offset=offset)
+    return IssueAdminListResponse(items=responses, total=total, limit=limit, offset=offset)
 
 
-@router.post("/issues/{issue_id}/respond-to-block", response_model=IssueResponse)
+@router.post("/issues/{issue_id}/respond-to-block", response_model=IssueAdminResponse)
 def respond_to_block(
     issue_id: uuid.UUID,
     message: str = Query(..., min_length=1, max_length=500, description="Message to worker about block"),
@@ -439,7 +471,7 @@ def respond_to_block(
         logger.error(f"Error responding to block on issue {issue_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to respond to block")
     
-    return IssueResponse.model_validate(issue)
+    return IssueAdminResponse.model_validate(issue)
 
 
 @router.post("/blocked-tasks/bulk-unblock", response_model=dict)
@@ -525,7 +557,7 @@ def bulk_unblock_tasks(
     }
 
 
-@router.post("/issues/{issue_id}/assign", response_model=IssueResponse)
+@router.post("/issues/{issue_id}/assign", response_model=IssueAdminResponse)
 def assign_worker(
     issue_id: uuid.UUID,
     body: AssignWorker,
@@ -631,10 +663,10 @@ def assign_worker(
         f"Admin {current_user.id} assigned worker {worker.id} to issue {issue_id}",
         extra={"worker_id": str(worker.id), "active_tasks": active_task_count}
     )
-    return IssueResponse.model_validate(issue)
+    return IssueAdminResponse.model_validate(issue)
 
 
-@router.post("/issues/{issue_id}/escalate", response_model=IssueResponse)
+@router.post("/issues/{issue_id}/escalate", response_model=IssueAdminResponse)
 def escalate_issue(
     issue_id: uuid.UUID,
     current_user: User = Depends(require_any_admin),
@@ -657,7 +689,7 @@ def escalate_issue(
         raise HTTPException(status_code=500, detail="Failed to escalate issue.")
 
     logger.info(f"Issue {issue_id} escalated by admin {current_user.id}")
-    return IssueResponse.model_validate(issue)
+    return IssueAdminResponse.model_validate(issue)
 
 
 # ── Bulk operations ───────────────────────────────────────────────────────────
@@ -1146,6 +1178,10 @@ def list_workers(
     size: int = Query(20, ge=1, le=200),
     is_online: Optional[bool] = Query(None),
     is_active: Optional[bool] = Query(None),
+    pending_invite: Optional[bool] = Query(
+        None,
+        description="True lists workers who have been invited but have not signed in yet.",
+    ),
     ward: Optional[str] = Query(None),
     department: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
@@ -1155,7 +1191,15 @@ def list_workers(
     """List workers in the admin's scope. **Roles**: any admin.
 
     Query params:
-      - is_active: true/false to list active or invited/inactive workers.
+      - is_active: true/false to list active or deactivated workers.
+      - pending_invite: true lists workers who still hold the temporary password
+        they were invited with — i.e. they have never signed in.
+
+    `pending_invite` exists because the console's "Invited workers" tab used to
+    approximate it with ``is_active=false``, which is a different set entirely:
+    deactivated workers. The two never overlap, so that tab listed people who
+    could not be re-invited while hiding everyone who was actually waiting on an
+    invitation.
     """
     try:
         # Filter on the role directly. This used to call get_users_by_role(),
@@ -1168,6 +1212,19 @@ def list_workers(
 
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
+
+        if pending_invite is not None:
+            # An invitation is only outstanding while the account is still
+            # usable; a deactivated worker holding a temporary password is not
+            # waiting on anything, and offering to re-send to them would create
+            # a working sign-in link for a disabled account.
+            if pending_invite:
+                query = query.filter(
+                    User.must_change_password == True,  # noqa: E712
+                    User.is_active == True,  # noqa: E712
+                )
+            else:
+                query = query.filter(User.must_change_password == False)  # noqa: E712
 
         # Scope by location FK when available
         scope = user_scope_filter(current_user)
@@ -2779,6 +2836,73 @@ def list_announcements(
     return {"items": [_announcement_out(a) for a in items], "total": total, "page": page, "size": size}
 
 
+class UpdateAnnouncementRequest(BaseModel):
+    """Request body for editing an announcement. All fields optional.
+
+    ``scope`` and its three target ids are deliberately absent. Re-scoping a
+    delivered announcement is not an edit — the citizens who received it are not
+    the citizens who would receive it now — so that is a delete plus a new post,
+    which is also what keeps the push audit honest.
+    """
+
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    body: Optional[str] = Field(None, min_length=1, max_length=5000)
+    expires_at: Optional[datetime] = Field(None, description="New expiry datetime (UTC)")
+    location_lat: Optional[float] = Field(None, description="Latitude citizens can view on map")
+    location_lng: Optional[float] = Field(None, description="Longitude citizens can view on map")
+
+
+@router.patch("/announcements/{announcement_id}")
+def update_announcement(
+    announcement_id: uuid.UUID,
+    body: UpdateAnnouncementRequest,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Edit an announcement's text, expiry or map pin.
+
+    Authorization matches ``DELETE``: author, or super-admin.
+
+    **Editing never re-notifies.** ``push_dispatched_at`` is the latch the
+    ``jobs`` service reads to decide who still needs a push; clearing it here
+    would re-deliver the announcement to every matching citizen, so a typo fix
+    would buzz an entire district a second time. It is therefore left untouched,
+    and returned in the response so the console can say plainly that the edit
+    will not reach anyone who already received the original.
+
+    Re-scoping is not offered — see ``UpdateAnnouncementRequest``.
+
+    **Roles**: any admin (must be author or super-admin).
+    """
+    ann = db.query(Announcement).filter(Announcement.id == announcement_id).first()
+    if not ann:
+        raise HTTPException(status_code=404, detail="Announcement not found")
+    if str(ann.author_id) != str(current_user.id) and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="You can only edit your own announcements")
+
+    # `exclude_unset` rather than `exclude_none`: an explicit null is how a
+    # caller clears an expiry or removes a map pin, and treating that the same
+    # as "field omitted" would make those two fields impossible to unset.
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    try:
+        for field, value in changes.items():
+            setattr(ann, field, value)
+        db.commit()
+        db.refresh(ann)
+    except Exception as e:
+        logger.error(f"Error updating announcement {announcement_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update announcement.")
+
+    logger.info(
+        f"Admin {current_user.id} edited announcement {announcement_id} "
+        f"fields={sorted(changes)} already_dispatched={ann.push_dispatched_at is not None}"
+    )
+    return _announcement_out(ann)
+
+
 @router.delete("/announcements/{announcement_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_announcement(
     announcement_id: uuid.UUID,
@@ -3152,6 +3276,135 @@ def get_squad(
 
 # ── Geofences ─────────────────────────────────────────────────────────────────
 
+
+def _jurisdiction_chain(
+    db: Session,
+    ward_id: Optional[uuid.UUID],
+    taluka_id: Optional[uuid.UUID],
+    district_id: Optional[uuid.UUID],
+    *,
+    strict: bool,
+) -> dict:
+    """Expand the most specific id given into a full ward/taluka/district chain.
+
+    ``apply_admin_scope`` filters on whichever single column matches the
+    caller's tier, so a zone stored with only ``ward_id`` would be invisible to
+    that ward's own taluka_admin. Every level therefore has to be present.
+
+    The chain is read from the ``Ward``/``Taluka`` rows rather than copied from
+    whoever supplied it. The denormalised columns on ``User`` are not reliably
+    complete — a ward_admin can have ``ward_id`` set and ``taluka_id`` NULL —
+    and trusting them produced exactly the under-populated row described above.
+
+    Args:
+        strict: raise 400 on an id that resolves to nothing. Used for
+            caller-supplied ids; a stale id on an admin's own record should
+            narrow their reach, not fail their request.
+    """
+    def _missing(what: str):
+        if strict:
+            raise HTTPException(status_code=400, detail=f"{what} does not exist")
+        return None
+
+    if ward_id:
+        ward = db.query(Ward).filter(Ward.id == ward_id).first()
+        if not ward:
+            _missing("ward_id")
+        else:
+            taluka = db.query(Taluka).filter(Taluka.id == ward.taluka_id).first()
+            return {
+                "ward_id": ward.id,
+                "taluka_id": ward.taluka_id,
+                "district_id": taluka.district_id if taluka else None,
+            }
+
+    if taluka_id:
+        taluka = db.query(Taluka).filter(Taluka.id == taluka_id).first()
+        if not taluka:
+            _missing("taluka_id")
+        else:
+            return {
+                "ward_id": None,
+                "taluka_id": taluka.id,
+                "district_id": taluka.district_id,
+            }
+
+    return {"ward_id": None, "taluka_id": None, "district_id": district_id}
+
+
+def _resolve_geofence_scope(current_user: User, body, db: Session) -> dict:
+    """Decide which jurisdiction a new geofence belongs to.
+
+    A **scoped admin** always gets their own scope, regardless of what the
+    request body asked for. Honouring a caller-supplied jurisdiction here would
+    be the same self-widening hole that ``PUT /auth/profile`` had: an admin able
+    to nominate a scope can create — and therefore manage — a zone anywhere.
+
+    A **super-admin** may target a jurisdiction explicitly. Supplying nothing
+    yields all-NULL: a state-level zone.
+
+    Returns:
+        A dict of ``ward_id``/``taluka_id``/``district_id`` ready to splat onto
+        the model.
+
+    Raises:
+        400: A super-admin named a ward or taluka that does not exist.
+    """
+    if current_user.role != "admin":
+        # A scoped admin with no scope at all is already refused upstream by
+        # get_admin_scope_filter's DENY_ALL, so this cannot quietly produce a
+        # state-level zone.
+        return _jurisdiction_chain(
+            db,
+            current_user.ward_id,
+            current_user.taluka_id,
+            current_user.district_id,
+            strict=False,
+        )
+
+    return _jurisdiction_chain(
+        db, body.ward_id, body.taluka_id, body.district_id, strict=True
+    )
+
+
+def _geofence_out(gf: Geofence, created_by_name: Optional[str] = None) -> GeofenceResponse:
+    """One serializer, so the four endpoints cannot drift apart."""
+    return GeofenceResponse(
+        id=gf.id,
+        name=gf.name,
+        latitude=gf.latitude,
+        longitude=gf.longitude,
+        radius_km=gf.radius_km,
+        created_by_name=(
+            created_by_name if created_by_name is not None
+            else (gf.created_by.name if gf.created_by else None)
+        ),
+        created_at=gf.created_at,
+        ward_id=gf.ward_id,
+        taluka_id=gf.taluka_id,
+        district_id=gf.district_id,
+    )
+
+
+def _geofence_in_scope(geofence_id: uuid.UUID, current_user: User, db: Session) -> Geofence:
+    """Fetch a geofence the caller is allowed to act on, or 404.
+
+    404 rather than 403 on purpose: a zone outside your jurisdiction should not
+    be distinguishable from one that does not exist, or the endpoint becomes a
+    way to enumerate other districts' zones.
+    """
+    geofence = (
+        apply_admin_scope(db.query(Geofence), current_user, Geofence)
+        .filter(Geofence.id == geofence_id)
+        .first()
+    )
+    if not geofence:
+        raise HTTPException(
+            status_code=404, detail="Geofence not found or outside your jurisdiction"
+        )
+    return geofence
+
+
 @router.get("/geofences", response_model=GeofenceListResponse)
 def list_geofences(
     page: int = Query(1, ge=1),
@@ -3159,45 +3412,32 @@ def list_geofences(
     current_user: User = Depends(require_any_admin),
     db: Session = Depends(get_db),
 ):
-    """List geofences with pagination and admin scope filtering.
-    
-    ADMIN ROLES AUDIT - GAP #5: Scope Consistency
-    Applies geographic scope filtering based on admin role.
-    - super_admin: sees all geofences
-    - district_admin: sees geofences in their district
-    - taluka_admin: sees geofences in their taluka
-    - ward_admin: sees geofences in their ward
-    
-    NOTE: Current Geofence model does not track ward_id/taluka_id/district_id.
-    For full geographic scoping, Geofence model needs to be extended with geographic fields
-    via database migration. Until then, all admins can see all geofences but access control
-    is enforced at creation/update/delete time.
-    
+    """List geofences in the admin's jurisdiction, paginated.
+
+    - super-admin:    every zone, including state-level ones
+    - district_admin: zones in their district
+    - taluka_admin:   zones in their taluka
+    - ward_admin:     zones in their ward
+
+    Zones with no jurisdiction (all three ids NULL) are state-level and appear
+    only for a super-admin. Every geofence created before ``a9b0c1d2e3`` is in
+    that category — there was no boundary geometry to derive a jurisdiction
+    from, so they were left for a super-admin to assign rather than guessed at.
+
     **Roles**: any admin.
-    
+
     Args:
         page: Page number (1-indexed), default 1
         size: Items per page (1-200), default 20
-    
+
     Returns:
         GeofenceListResponse with items, total, page, size
     """
     try:
-        query = db.query(Geofence)
-        
-        # FUTURE: Apply geographic scope filtering once Geofence model has geographic fields
-        # For now, all admins see all geofences (system-level resource)
-        # TODO: Add ward_id, taluka_id, district_id to Geofence model and apply:
-        # if current_user.role == "ward_admin" and current_user.ward_id:
-        #     query = query.filter(Geofence.ward_id == current_user.ward_id)
-        # elif current_user.role == "taluka_admin" and current_user.taluka_id:
-        #     query = query.filter(Geofence.taluka_id == current_user.taluka_id)
-        # elif current_user.role == "district_admin" and current_user.district_id:
-        #     query = query.filter(Geofence.district_id == current_user.district_id)
-        # super_admin views all
-        
+        query = apply_admin_scope(db.query(Geofence), current_user, Geofence)
+
         total = query.count()
-        
+
         geofences = (
             query
             .order_by(Geofence.created_at.desc(), Geofence.id.desc())
@@ -3205,21 +3445,9 @@ def list_geofences(
             .limit(size)
             .all()
         )
-        
-        items = []
-        for gf in geofences:
-            items.append(GeofenceResponse(
-                id=gf.id,
-                name=gf.name,
-                latitude=gf.latitude,
-                longitude=gf.longitude,
-                radius_km=gf.radius_km,
-                created_by_name=gf.created_by.name if gf.created_by else None,
-                created_at=gf.created_at,
-            ))
-        
+
         return GeofenceListResponse(
-            items=items,
+            items=[_geofence_out(gf) for gf in geofences],
             total=total,
             page=page,
             size=size,
@@ -3236,12 +3464,18 @@ def create_geofence(
     db: Session = Depends(get_db),
 ):
     """Create a new geofence zone.
-    
-    **Roles**: admin or district_admin.
-    
+
+    The zone is stamped with the caller's own jurisdiction. A scoped admin
+    cannot choose one — supplying ``ward_id``/``taluka_id``/``district_id`` is
+    honoured only for a super-admin, because an admin able to nominate a scope
+    could create, and thereafter manage, a zone anywhere in the state.
+
+    **Roles**: any admin.
+
     Args:
-        body: CreateGeofenceRequest with name, latitude, longitude, radius_km
-    
+        body: CreateGeofenceRequest with name, latitude, longitude, radius_km,
+              and optionally a jurisdiction (super-admin only).
+
     Returns:
         Created GeofenceResponse
     """
@@ -3269,8 +3503,21 @@ def create_geofence(
             # written for operators and are safe, but bound the length.
             raise HTTPException(status_code=400, detail=str(e)[:200])
         
+        # Where this zone belongs. Resolved before the overlap check so the
+        # comparison is against zones the caller can actually see.
+        scope = _resolve_geofence_scope(current_user, body, db)
+
         # MEDIUM PRIORITY BUG FIX #4: Check for overlapping geofences
-        existing_geofences = db.query(Geofence).all()
+        #
+        # Scoped to the caller's jurisdiction. Unscoped, this both loaded every
+        # zone in the state on each create and named the colliding ones in the
+        # 409 — so a ward_admin learned the names of zones in districts they
+        # cannot otherwise see. The trade-off is that overlaps across a
+        # jurisdiction boundary are no longer reported, which is the right way
+        # round: a neighbouring district's zone is not this admin's to move.
+        existing_geofences = apply_admin_scope(
+            db.query(Geofence), current_user, Geofence
+        ).all()
         overlapping = []
         for existing in existing_geofences:
             if check_geofences_intersect(
@@ -3295,23 +3542,19 @@ def create_geofence(
             longitude=body.longitude,
             radius_km=body.radius_km,
             created_by_id=current_user.id,
+            **scope,
         )
-        
+
         db.add(geofence)
         db.commit()
         db.refresh(geofence)
-        
-        logger.info(f"Admin {current_user.id} created geofence {geofence.id}: {geofence.name}")
-        
-        return GeofenceResponse(
-            id=geofence.id,
-            name=geofence.name,
-            latitude=geofence.latitude,
-            longitude=geofence.longitude,
-            radius_km=geofence.radius_km,
-            created_by_name=current_user.name,
-            created_at=geofence.created_at,
+
+        logger.info(
+            f"Admin {current_user.id} created geofence {geofence.id}: {geofence.name} "
+            f"ward={scope['ward_id']} taluka={scope['taluka_id']} district={scope['district_id']}"
         )
+
+        return _geofence_out(geofence, created_by_name=current_user.name)
     except HTTPException:
         raise
     except Exception as e:
@@ -3328,21 +3571,27 @@ def update_geofence(
     db: Session = Depends(get_db),
 ):
     """Update a geofence zone (all fields optional).
-    
-    **Roles**: admin or district_admin.
-    
+
+    Restricted to zones inside the caller's jurisdiction. Until this check
+    existed, any admin tier could edit any zone in the state.
+
+    A zone's jurisdiction is not editable here — moving a zone between wards is
+    a transfer of ownership, not a field update, and re-scoping it out from
+    under its current admin should be a deliberate super-admin act rather than a
+    side effect of nudging a radius.
+
+    **Roles**: any admin, within their own jurisdiction.
+
     Args:
         geofence_id: UUID of the geofence to update
         body: UpdateGeofenceRequest with optional fields
-    
+
     Returns:
         Updated GeofenceResponse
     """
     try:
-        geofence = db.query(Geofence).filter(Geofence.id == geofence_id).first()
-        if not geofence:
-            raise HTTPException(status_code=404, detail="Geofence not found")
-        
+        geofence = _geofence_in_scope(geofence_id, current_user, db)
+
         # Update fields if provided
         if body.name is not None:
             if not body.name or not body.name.strip():
@@ -3366,24 +3615,181 @@ def update_geofence(
         
         db.commit()
         db.refresh(geofence)
-        
+
         logger.info(f"Admin {current_user.id} updated geofence {geofence.id}")
-        
-        return GeofenceResponse(
-            id=geofence.id,
-            name=geofence.name,
-            latitude=geofence.latitude,
-            longitude=geofence.longitude,
-            radius_km=geofence.radius_km,
-            created_by_name=geofence.created_by.name if geofence.created_by else None,
-            created_at=geofence.created_at,
-        )
+
+        return _geofence_out(geofence)
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error updating geofence {geofence_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to update geofence.")
+
+
+@router.get("/geofences/{geofence_id}/workers", response_model=dict)
+def geofence_workers(
+    geofence_id: uuid.UUID,
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Which workers are currently inside this zone.
+
+    ``User.latitude``/``longitude`` is a **single mutable point**, not a track —
+    it is overwritten on each location update and there is no history table. So
+    this answers "where was each worker when they last reported", which is not
+    the same as "where are they now".
+
+    That distinction matters enough to be in the payload rather than only in
+    this docstring: ``location_updated_at`` and ``location_age_minutes`` are
+    returned per worker, and ``stale`` marks anyone whose fix predates the
+    threshold below. Without it, a worker whose phone died three hours ago in
+    the zone reads as present.
+
+    Workers are restricted to the caller's jurisdiction by the same
+    ``user_scope_filter`` used elsewhere, so this cannot be used to locate
+    another district's staff.
+
+    **Roles**: any admin, for zones within their own jurisdiction.
+    """
+    #: A fix older than this is reported but flagged. Half an hour is roughly
+    #: the point past which "last seen here" stops implying "is here".
+    STALE_AFTER_MINUTES = 30
+
+    geofence = _geofence_in_scope(geofence_id, current_user, db)
+
+    try:
+        # Bounding box first so the exact haversine check below runs over a
+        # small candidate set rather than every worker in the state.
+        lat_delta = geofence.radius_km / 111.0
+        lon_delta = geofence.radius_km / max(
+            111.0 * abs(math.cos(math.radians(geofence.latitude))), 1e-6
+        )
+
+        query = db.query(User).filter(
+            User.role == "worker",
+            User.is_active == True,  # noqa: E712
+            User.latitude.isnot(None),
+            User.longitude.isnot(None),
+            User.latitude.between(geofence.latitude - lat_delta, geofence.latitude + lat_delta),
+            User.longitude.between(geofence.longitude - lon_delta, geofence.longitude + lon_delta),
+        )
+        scope_filters = user_scope_filter(current_user)
+        if scope_filters:
+            query = query.filter(*scope_filters)
+
+        now = now_utc()
+        workers = []
+        for worker in query.limit(500).all():
+            if not point_in_geofence(
+                worker.latitude, worker.longitude,
+                geofence.latitude, geofence.longitude, geofence.radius_km,
+            ):
+                continue
+
+            age_minutes = None
+            if worker.location_updated_at:
+                age_minutes = round(
+                    (now - worker.location_updated_at).total_seconds() / 60, 1
+                )
+
+            workers.append({
+                "id": str(worker.id),
+                "name": worker.name,
+                "is_online": bool(worker.is_online),
+                "latitude": worker.latitude,
+                "longitude": worker.longitude,
+                "distance_km": round(
+                    haversine_distance(
+                        worker.latitude, worker.longitude,
+                        geofence.latitude, geofence.longitude,
+                    ),
+                    2,
+                ),
+                "location_updated_at": (
+                    worker.location_updated_at.isoformat()
+                    if worker.location_updated_at else None
+                ),
+                "location_age_minutes": age_minutes,
+                # No fix timestamp at all is treated as stale — an unknown age
+                # is not evidence of freshness.
+                "stale": age_minutes is None or age_minutes > STALE_AFTER_MINUTES,
+            })
+
+        workers.sort(key=lambda w: w["distance_km"])
+    except Exception as e:
+        logger.error(f"Error listing workers in geofence {geofence_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch workers in zone.")
+
+    return {
+        "geofence": {
+            "id": str(geofence.id),
+            "name": geofence.name,
+            "latitude": geofence.latitude,
+            "longitude": geofence.longitude,
+            "radius_km": geofence.radius_km,
+        },
+        "total": len(workers),
+        "fresh": sum(1 for w in workers if not w["stale"]),
+        "stale_after_minutes": STALE_AFTER_MINUTES,
+        "workers": workers,
+    }
+
+
+@router.get("/geofences/{geofence_id}/alerts", response_model=dict)
+def geofence_alerts(
+    geofence_id: uuid.UUID,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=200),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Broadcast history for a zone, newest first.
+
+    History starts at migration ``b0c1d2e3f4``. Before it, ``POST
+    /admin/notifications/geofence`` persisted nothing at all, so there is no
+    earlier data and none was invented — an empty list on an old zone means "not
+    recorded", not "never alerted".
+
+    **Roles**: any admin, for zones within their own jurisdiction.
+    """
+    geofence = _geofence_in_scope(geofence_id, current_user, db)
+
+    try:
+        query = db.query(GeofenceAlert).filter(GeofenceAlert.geofence_id == geofence.id)
+        total = query.count()
+        rows = (
+            query.order_by(GeofenceAlert.created_at.desc())
+            .offset((page - 1) * size)
+            .limit(size)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Error listing alerts for geofence {geofence_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch zone alerts.")
+
+    return {
+        "items": [
+            {
+                "id": str(row.id),
+                "title": row.title,
+                "body": row.body,
+                "latitude": row.latitude,
+                "longitude": row.longitude,
+                "radius_km": row.radius_km,
+                "recipients_notified": row.recipients_notified,
+                "recipients_failed": row.recipients_failed,
+                "sent_by_id": str(row.sent_by_id) if row.sent_by_id else None,
+                "sent_by_name": row.sent_by.name if row.sent_by else None,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+        "history_since": "migration b0c1d2e3f4 — earlier broadcasts were not recorded",
+    }
 
 
 @router.delete("/geofences/{geofence_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -3393,17 +3799,19 @@ def delete_geofence(
     db: Session = Depends(get_db),
 ):
     """Delete a geofence zone.
-    
-    **Roles**: admin or district_admin.
-    
+
+    Restricted to zones inside the caller's jurisdiction. This is the endpoint
+    the missing check mattered most on: a single-ward admin could delete any
+    zone in the state, and the deletion is not recoverable.
+
+    **Roles**: any admin, within their own jurisdiction.
+
     Args:
         geofence_id: UUID of the geofence to delete
     """
     try:
-        geofence = db.query(Geofence).filter(Geofence.id == geofence_id).first()
-        if not geofence:
-            raise HTTPException(status_code=404, detail="Geofence not found")
-        
+        geofence = _geofence_in_scope(geofence_id, current_user, db)
+
         db.delete(geofence)
         db.commit()
         
@@ -3464,15 +3872,280 @@ def get_analytics(
     }
 
 
+#: Below this, an AI classification is treated as needing a human look.
+AI_LOW_CONFIDENCE = 0.7
+
+#: A category must move by at least this fraction, off at least this many
+#: issues, before it is called out. Without both guards a category going from
+#: 1 issue to 3 is a "200% surge", which is noise dressed as a finding.
+_MOVEMENT_THRESHOLD = 0.25
+_MOVEMENT_MIN_BASE = 5
+
+#: Narrative cache: {(scope_key, days): (generated_at, text)}. Process-local.
+_INSIGHT_NARRATIVE_CACHE: Dict[tuple, tuple] = {}
+
+#: How long a generated narrative stays usable.
+#:
+#: Not keyed per calendar day: the numbers beside it are recomputed on every
+#: request, so a day-old sentence sitting next to a fresh `generated_at` would
+#: describe a dataset that no longer exists. Fifteen minutes keeps the cost off
+#: the page load while staying close enough to the figures it describes — and
+#: `narrative_generated_at` is returned so the console can date it explicitly.
+_NARRATIVE_TTL = timedelta(minutes=15)
+
+
+def _clear_insight_cache() -> None:
+    """Drop every cached narrative. Used by tests; harmless in production."""
+    _INSIGHT_NARRATIVE_CACHE.clear()
+
+
+def _scope_cache_key(user: User) -> str:
+    """Cache identity for an admin's visible dataset, not their user id.
+
+    Two ward admins in the same ward see identical figures, so they should share
+    a cache entry rather than each paying for a generation.
+    """
+    return f"{user.role}:{user.ward_id}:{user.taluka_id}:{user.district_id}"
+
+
+@router.get("/insights", response_model=dict)
+def get_insights(
+    days: int = Query(30, ge=7, le=90, description="Length of the current period"),
+    narrative: bool = Query(True, description="Include a written summary if a provider is configured"),
+    current_user: User = Depends(require_any_admin),
+    db: Session = Depends(get_db),
+):
+    """Aggregate insights for the admin's jurisdiction.
+
+    This replaces what the console was doing in the browser: paging through
+    ``/admin/issues`` 200 rows at a time up to a 2,000-row ceiling, aggregating
+    client-side, and rendering an amber banner admitting the figures were a
+    sample rather than a total. Every count below is computed in SQL over the
+    whole scoped dataset, so it is a total.
+
+    Three blocks:
+
+    * ``ai_quality`` — how much the classifier is producing, how confident it
+      is, and how much it has flagged as poorly resolved. This is the data the
+      AI-insights screen displays.
+    * ``movement`` — each issue type this period against the one before it.
+      Guarded twice, by percentage *and* by absolute base, because a category
+      going 1 → 3 is not a 200% surge worth an admin's attention.
+    * ``anomalies`` — wards whose share of reports moved sharply.
+
+    ``narrative`` is best-effort. If no provider key is configured, or the call
+    fails, the field is ``null`` and every number above is still returned — a
+    dashboard must not go blank because a third party is down.
+
+    **Roles**: any admin (scoped).
+    """
+    try:
+        now = now_utc()
+        current_start = now - timedelta(days=days)
+        previous_start = current_start - timedelta(days=days)
+
+        def scoped():
+            return apply_not_deleted_filter(
+                apply_admin_scope(db.query(Issue), current_user, Issue)
+            )
+
+        # ── AI quality, in SQL rather than 2,000 rows over the wire ──────────
+        has_ai = (Issue.ai_confidence.isnot(None)) | (Issue.ai_resolution_quality.isnot(None))
+        ai_row = scoped().with_entities(
+            func.count(Issue.id).filter(has_ai).label("analysed"),
+            func.count(Issue.id)
+            .filter(Issue.ai_confidence.isnot(None), Issue.ai_confidence < AI_LOW_CONFIDENCE)
+            .label("low_confidence"),
+            func.count(Issue.id)
+            .filter(Issue.ai_resolution_quality == "poor")
+            .label("poor_resolutions"),
+            func.avg(Issue.ai_confidence).label("avg_confidence"),
+            func.count(Issue.id).label("total"),
+        ).one()
+
+        # ── Category movement, period over period ────────────────────────────
+        def counts_by_type(start, end):
+            rows = (
+                scoped()
+                .filter(Issue.created_at >= start, Issue.created_at < end)
+                .with_entities(Issue.issue_type, func.count(Issue.id))
+                .group_by(Issue.issue_type)
+                .all()
+            )
+            return {issue_type: count for issue_type, count in rows}
+
+        current = counts_by_type(current_start, now)
+        previous = counts_by_type(previous_start, current_start)
+
+        movement = []
+        for issue_type in sorted(set(current) | set(previous)):
+            now_count = current.get(issue_type, 0)
+            then_count = previous.get(issue_type, 0)
+            # A category that did not exist last period has no meaningful
+            # percentage; report the delta and leave change_pct null rather
+            # than dividing by zero or inventing "infinite growth".
+            change_pct = (
+                round((now_count - then_count) / then_count * 100, 1) if then_count else None
+            )
+            movement.append({
+                "issue_type": issue_type,
+                "current": now_count,
+                "previous": then_count,
+                "delta": now_count - then_count,
+                "change_pct": change_pct,
+                "notable": (
+                    then_count >= _MOVEMENT_MIN_BASE
+                    and change_pct is not None
+                    and abs(change_pct) >= _MOVEMENT_THRESHOLD * 100
+                ),
+            })
+        movement.sort(key=lambda m: abs(m["delta"]), reverse=True)
+
+        # ── Ward anomalies, same double guard ────────────────────────────────
+        def counts_by_ward(start, end):
+            rows = (
+                scoped()
+                .filter(Issue.created_at >= start, Issue.created_at < end, Issue.ward.isnot(None))
+                .with_entities(Issue.ward, func.count(Issue.id))
+                .group_by(Issue.ward)
+                .all()
+            )
+            return {ward: count for ward, count in rows}
+
+        ward_now = counts_by_ward(current_start, now)
+        ward_then = counts_by_ward(previous_start, current_start)
+
+        anomalies = []
+        for ward, now_count in ward_now.items():
+            then_count = ward_then.get(ward, 0)
+            if then_count < _MOVEMENT_MIN_BASE:
+                continue
+            change = (now_count - then_count) / then_count
+            if abs(change) >= _MOVEMENT_THRESHOLD:
+                anomalies.append({
+                    "ward": ward,
+                    "current": now_count,
+                    "previous": then_count,
+                    "change_pct": round(change * 100, 1),
+                    "direction": "up" if change > 0 else "down",
+                })
+        anomalies.sort(key=lambda a: abs(a["change_pct"]), reverse=True)
+        anomalies = anomalies[:10]
+
+        # ── Resolution throughput ────────────────────────────────────────────
+        resolved_now = (
+            scoped()
+            .filter(Issue.resolved_at >= current_start, Issue.resolved_at < now)
+            .count()
+        )
+        resolved_then = (
+            scoped()
+            .filter(Issue.resolved_at >= previous_start, Issue.resolved_at < current_start)
+            .count()
+        )
+        opened_now = sum(current.values())
+
+        payload = {
+            "period_days": days,
+            "period_start": current_start.isoformat(),
+            "generated_at": now.isoformat(),
+            "ai_quality": {
+                "total_issues": ai_row.total or 0,
+                "analysed": ai_row.analysed or 0,
+                "low_confidence": ai_row.low_confidence or 0,
+                "poor_resolutions": ai_row.poor_resolutions or 0,
+                "avg_confidence": (
+                    round(float(ai_row.avg_confidence), 3) if ai_row.avg_confidence else None
+                ),
+                "low_confidence_threshold": AI_LOW_CONFIDENCE,
+            },
+            "throughput": {
+                "opened": opened_now,
+                "resolved": resolved_now,
+                "resolved_previous": resolved_then,
+                # >1 means the backlog grew over the period.
+                "backlog_ratio": (
+                    round(opened_now / resolved_now, 2) if resolved_now else None
+                ),
+            },
+            "movement": movement,
+            "anomalies": anomalies,
+            "narrative": None,
+            "narrative_generated_at": None,
+        }
+    except Exception as e:
+        logger.error(f"Error building insights: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to build insights.")
+
+    if narrative:
+        text, generated_at = _insight_narrative(current_user, days, payload)
+        payload["narrative"] = text
+        payload["narrative_generated_at"] = generated_at.isoformat() if generated_at else None
+
+    return payload
+
+
+def _insight_narrative(current_user: User, days: int, payload: dict):
+    """A written summary of the aggregates, and when it was written.
+
+    Cached per (scope, period) for ``_NARRATIVE_TTL``. Without a cache this is
+    an LLM round-trip on every dashboard load — a per-view cost, and a
+    third-party dependency sitting in front of numbers that are already computed
+    and correct.
+
+    Never raises. A provider outage degrades the dashboard to numbers rather
+    than to a 500, which is why the caller drops this into an already-complete
+    payload rather than building the payload around it.
+
+    Returns:
+        ``(text, generated_at)``, either of which may be ``None``.
+    """
+    if not settings.GROQ_API_KEY:
+        return None, None
+
+    key = (_scope_cache_key(current_user), days)
+    now = now_utc()
+
+    cached = _INSIGHT_NARRATIVE_CACHE.get(key)
+    if cached and now - cached[0] < _NARRATIVE_TTL:
+        return cached[1], cached[0]
+
+    try:
+        from app.services.ai_service import summarise_insights
+
+        text = summarise_insights(payload)
+    except Exception as e:
+        # Warning, not error: every number is present and the dashboard is
+        # fully usable without this.
+        logger.warning(f"Insight narrative unavailable: {e}")
+        # Fall back to the expired entry if there is one — a 15-minute-old
+        # sentence, dated as such, beats no sentence at all.
+        return (cached[1], cached[0]) if cached else (None, None)
+
+    if not text:
+        return None, None
+
+    # Bounded so a long-running process cannot accumulate an entry per
+    # (scope, period) indefinitely.
+    if len(_INSIGHT_NARRATIVE_CACHE) > 256:
+        _INSIGHT_NARRATIVE_CACHE.clear()
+    _INSIGHT_NARRATIVE_CACHE[key] = (now, text)
+    return text, now
+
+
 @router.post("/notifications/geofence", response_model=dict, status_code=status.HTTP_200_OK)
 def send_geofence_notification(
-    latitude: float = Query(..., description="Center latitude"),
-    longitude: float = Query(..., description="Center longitude"),
-    # le: unbounded, radius_km=99999 push-notified every user in the country
-    # with an attacker-controlled title and body, from any admin role.
-    radius_km: float = Query(..., gt=0, le=50, description="Radius in kilometers (max 50)"),
     title: str = Query(..., description="Notification title"),
     body: str = Query(..., description="Notification body"),
+    geofence_id: Optional[uuid.UUID] = Query(
+        None,
+        description="Broadcast to a saved zone. Supply this OR latitude/longitude/radius_km.",
+    ),
+    latitude: Optional[float] = Query(None, description="Center latitude (ad-hoc circle)"),
+    longitude: Optional[float] = Query(None, description="Center longitude (ad-hoc circle)"),
+    # le: unbounded, radius_km=99999 push-notified every user in the country
+    # with an attacker-controlled title and body, from any admin role.
+    radius_km: Optional[float] = Query(None, gt=0, le=50, description="Radius in km (max 50)"),
     location_lat: Optional[float] = Query(None, description="Clickable map location latitude (defaults to center)"),
     location_lng: Optional[float] = Query(None, description="Clickable map location longitude (defaults to center)"),
     current_user: User = Depends(require_role("admin", "district_admin", "taluka_admin", "ward_admin")),
@@ -3480,19 +4153,48 @@ def send_geofence_notification(
 ):
     """
     Send bulk push notification to all citizens and workers within a geofence.
-    
+
     Notifies users who have:
     1. Location data (latitude/longitude from app)
     2. FCM token registered
     3. Active account
-    
-    **Parameters**:
-    - `latitude`, `longitude`: Center point of geofence
-    - `radius_km`: Circular radius in kilometers
-    - `title`, `body`: Notification content
-    
-    **Returns**: Count of users notified
+
+    **Two ways to aim it:**
+
+    - ``geofence_id`` — broadcast to a saved zone. The centre and radius come
+      from the zone, and the resulting record is **linked** to it, which is what
+      makes ``GET /admin/geofences/{id}/alerts`` show a history. The zone must
+      be within your jurisdiction.
+    - ``latitude`` + ``longitude`` + ``radius_km`` — an ad-hoc circle, for a
+      one-off that does not correspond to a saved zone. Recorded with the circle
+      but no zone link, because attributing it to one would be a guess.
+
+    Either way the dispatch is written to ``geofence_alerts``. It previously
+    existed only as this response and a log line, so a broadcast that reached
+    nobody looked exactly like one that reached everybody.
+
+    **Returns**: Count of users notified, plus the id of the recorded alert.
     """
+    zone = None
+    if geofence_id is not None:
+        if any(v is not None for v in (latitude, longitude, radius_km)):
+            raise HTTPException(
+                status_code=400,
+                detail="Supply either geofence_id or latitude/longitude/radius_km, not both",
+            )
+        zone = _geofence_in_scope(geofence_id, current_user, db)
+        latitude, longitude, radius_km = zone.latitude, zone.longitude, zone.radius_km
+        if radius_km > 50:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Zone radius {radius_km:g} km exceeds the 50 km broadcast limit",
+            )
+    elif None in (latitude, longitude, radius_km):
+        raise HTTPException(
+            status_code=400,
+            detail="Supply geofence_id, or all of latitude, longitude and radius_km",
+        )
+
     try:
         from app.services.notification_service import notify
         from math import pi, acos, sin, cos
@@ -3584,8 +4286,36 @@ def send_geofence_notification(
             f"{failed_count} failures"
         )
 
+        # Record the broadcast. This used to exist only as the HTTP response and
+        # a log line, so a zone's alert history could not be shown, audited, or
+        # reconstructed — and a broadcast that reached nobody was
+        # indistinguishable from one that reached everybody.
+        #
+        # `geofence_id` is set only when the caller actually named a zone. For
+        # an ad-hoc circle it stays NULL rather than being matched to whichever
+        # saved zone happens to sit nearby, which would be a guess. The circle
+        # is stored either way, since that is the fact that occurred.
+        alert = GeofenceAlert(
+            id=uuid.uuid4(),
+            geofence_id=zone.id if zone else None,
+            latitude=latitude,
+            longitude=longitude,
+            radius_km=radius_km,
+            title=title[:200],
+            body=body,
+            sent_by_id=current_user.id,
+            recipients_notified=notified_count,
+            recipients_failed=failed_count,
+            ward_id=current_user.ward_id,
+            taluka_id=current_user.taluka_id,
+            district_id=current_user.district_id,
+        )
+        db.add(alert)
+        db.commit()
+
         return {
             "success": True,
+            "alert_id": str(alert.id),
             "citizens_notified": notified_count,
             "citizens_failed": failed_count,
             "geofence": {
@@ -3698,6 +4428,13 @@ def _announcement_out(ann: Announcement) -> dict:
         "district_id": str(ann.district_id) if ann.district_id else None,
         "expires_at": ann.expires_at.isoformat() if ann.expires_at else None,
         "created_at": ann.created_at.isoformat() if ann.created_at else None,
+        "updated_at": ann.updated_at.isoformat() if ann.updated_at else None,
+        # Non-null means the push fan-out has already run. The console needs
+        # this to tell an editor that their change will not reach anyone who
+        # received the original — editing deliberately does not re-notify.
+        "push_dispatched_at": (
+            ann.push_dispatched_at.isoformat() if ann.push_dispatched_at else None
+        ),
         "author_id": str(ann.author_id),
         "location_lat": ann.location_lat,
         "location_lng": ann.location_lng,

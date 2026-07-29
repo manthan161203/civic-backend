@@ -58,5 +58,14 @@ class Announcement(Base):
     push_dispatched_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    # Set on every UPDATE. Needed because an announcement can now be edited
+    # after it has been delivered, and "created 3 days ago" alone would not tell
+    # a reader that the text in front of them is not the text that went out.
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
     author = relationship("User")

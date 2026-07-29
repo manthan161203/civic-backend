@@ -41,32 +41,54 @@ def my_rewards(
     return get_user_summary(db, current_user.id)
 
 
+#: Time window for a leaderboard, in days. ``None`` is all-time.
+#:
+#: The board was all-time only, which makes it unwinnable: an account active
+#: since launch cannot be caught, so the ranking stops motivating anyone who
+#: joins later. Naming matches ``GET /public/leaderboard``, which already took
+#: a ``days`` parameter.
+_PERIOD_DAYS = Query(
+    None,
+    ge=1,
+    le=365,
+    description="Rank on points earned in the last N days. Omit for all-time.",
+)
+
+
 @router.get("/leaderboard/citizens", response_model=List[LeaderboardEntry])
 def citizen_leaderboard(
     limit: int = Query(10, ge=1, le=50, description="Number of entries to return"),
     offset: int = Query(0, ge=0, description="Number of entries to skip (for pagination)"),
+    days: Optional[int] = _PERIOD_DAYS,
     db: Session = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
     """Top citizens ranked by total reward points.
 
+    ``level`` and ``badges`` stay lifetime figures even with ``days`` set — a
+    badge earned last year is not un-earned by asking for this week's board.
+
     **Roles**: any authenticated user.
     """
-    return get_leaderboard(db, role="citizen", limit=limit, offset=offset)
+    return get_leaderboard(db, role="citizen", limit=limit, offset=offset, days=days)
 
 
 @router.get("/leaderboard/workers", response_model=List[LeaderboardEntry])
 def worker_leaderboard_rewards(
     limit: int = Query(10, ge=1, le=50, description="Number of entries to return"),
     offset: int = Query(0, ge=0, description="Number of entries to skip (for pagination)"),
+    days: Optional[int] = _PERIOD_DAYS,
     db: Session = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
     """Top workers ranked by total reward points.
 
+    With ``days`` set, ``tasks_completed`` and ``avg_rating`` are restricted to
+    the same window (keyed on ``resolved_at``) so the two halves of a row agree.
+
     **Roles**: any authenticated user.
     """
-    return get_leaderboard(db, role="worker", limit=limit, offset=offset)
+    return get_leaderboard(db, role="worker", limit=limit, offset=offset, days=days)
 
 
 @router.get("/badges", response_model=List[BadgeDefinitionOut])
